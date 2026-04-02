@@ -10,6 +10,8 @@
 #include <algorithm>
 #include <iomanip>
 #include <iostream>
+#include <limits>
+#include <map>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -30,75 +32,106 @@ MakeUniformRv(double minValue, double maxValue)
     return oss.str();
 }
 
-static void
-InstallAgribotClusterMobility(const NodeContainer& cluster,
-                              const Rectangle& bounds,
-                              double agribotSpeedMax)
+static Ptr<RandomRectanglePositionAllocator>
+CreateUniformPositionAllocator(const Rectangle& bounds)
 {
-    // --- Movilidad: Agribots (Nivel 1) ---------------------------------------
-    // Se instala RandomWaypointMobilityModel dentro de un rectangulo especifico
-    // (bounding box) para representar una zona de cultivo independiente.
-    // Cada cluster usa su propio asignador de posiciones aleatorias (X,Y).
-
-    const double maxSpeed = std::max(0.6, agribotSpeedMax);
-
     Ptr<RandomRectanglePositionAllocator> posAlloc = CreateObject<RandomRectanglePositionAllocator>();
     posAlloc->SetAttribute("X", StringValue(MakeUniformRv(bounds.xMin, bounds.xMax)));
     posAlloc->SetAttribute("Y", StringValue(MakeUniformRv(bounds.yMin, bounds.yMax)));
-
-    MobilityHelper mobility;
-    mobility.SetPositionAllocator(posAlloc);
-    mobility.SetMobilityModel("ns3::RandomWaypointMobilityModel",
-                              "Speed",
-                              StringValue(MakeUniformRv(0.5, maxSpeed)),
-                              "Pause",
-                              StringValue("ns3::ConstantRandomVariable[Constant=1.0]"),
-                              "PositionAllocator",
-                              PointerValue(posAlloc));
-    mobility.Install(cluster);
+    return posAlloc;
 }
 
 static void
-ConfigureTractorWaypoints(const NodeContainer& tractors,
-                          double simTime,
-                          double xMin,
-                          double xMax,
-                          double y0,
-                          double laneSeparation,
-                          double legDuration)
+ConfigureLeaderWaypoints(const NodeContainer& leaders,
+                         double simTime,
+                         const Rectangle& fieldBounds,
+                         double leaderSpeed)
 {
-    // --- Movilidad: Tractores/Superhosts (Nivel 2) ---------------------------
-    // Se usa WaypointMobilityModel para imponer trayectorias lineales paralelas.
-    // Esto conserva la simetria espacial entre tractores, requisito central de
-    // la hipotesis experimental.
+    const double speed = std::max(0.5, leaderSpeed);
+    const double xMin = fieldBounds.xMin + 5.0;
+    const double xMax = fieldBounds.xMax - 5.0;
+    const double legDuration = std::max(1.0, (xMax - xMin) / speed);
+    const double laneSpacing =
+        (fieldBounds.yMax - fieldBounds.yMin) / static_cast<double>(leaders.GetN() + 1);
 
-    for (uint32_t i = 0; i < tractors.GetN(); ++i)
+    for (uint32_t i = 0; i < leaders.GetN(); ++i)
     {
-        Ptr<WaypointMobilityModel> wp = tractors.Get(i)->GetObject<WaypointMobilityModel>();
-        if (!wp)
+        Ptr<WaypointMobilityModel> waypoint = leaders.Get(i)->GetObject<WaypointMobilityModel>();
+        if (!waypoint)
         {
-            NS_FATAL_ERROR("WaypointMobilityModel no instalado en tractor " << i);
+            NS_FATAL_ERROR("WaypointMobilityModel no instalado en lider " << i);
         }
 
-        const double laneY = y0 + laneSeparation * static_cast<double>(i);
+        const double laneY = fieldBounds.yMin + laneSpacing * static_cast<double>(i + 1);
+        double t = 0.0;
+        double x = xMin;
 
-        // Waypoint inicial unico en t=0.
-        wp->AddWaypoint(Waypoint(Seconds(0.0), Vector(xMin, laneY, 0.0)));
-
-        // El siguiente waypoint debe tener tiempo estrictamente mayor a 0.
-        double t = legDuration;
-        double x = xMax;     // primer tramo: xMin -> xMax
-        bool toRight = false; // despues alterna hacia xMin, luego xMax, etc.
-
-        // Barrido de ida y vuelta lineal, paralelo para todos los tractores.
-        while (t <= simTime + legDuration)
+        waypoint->AddWaypoint(Waypoint(Seconds(t), Vector(x, laneY, 0.0)));
+        while (t + legDuration <= simTime + legDuration)
         {
-            wp->AddWaypoint(Waypoint(Seconds(t), Vector(x, laneY, 0.0)));
-            x = toRight ? xMax : xMin;
-            toRight = !toRight;
             t += legDuration;
+            x = (x == xMin) ? xMax : xMin;
+            waypoint->AddWaypoint(Waypoint(Seconds(t), Vector(x, laneY, 0.0)));
         }
     }
+}
+
+static void
+InstallFollowerClusterMobility(const NodeContainer& followers,
+                               Ptr<MobilityModel> leaderMobility,
+                               const Rectangle& localBounds,
+                               double followerSpeedMax)
+{
+    if (followers.GetN() == 0)
+    {
+        return;
+    }
+
+    GroupMobilityHelper mobility;
+    mobility.SetReferenceMobilityModel(leaderMobility);
+    mobility.SetMemberPositionAllocator(CreateUniformPositionAllocator(localBounds));
+    mobility.SetMemberMobilityModel("ns3::RandomWalk2dMobilityModel",
+                                    "Bounds",
+                                    RectangleValue(localBounds),
+                                    "Mode",
+                                    EnumValue(RandomWalk2dMobilityModel::MODE_TIME),
+                                    "Time",
+                                    TimeValue(Seconds(2.0)),
+                                    "Speed",
+                                    StringValue(MakeUniformRv(0.3, std::max(0.6, followerSpeedMax))));
+    mobility.Install(followers);
+}
+
+static void
+InstallSensorMobility(const NodeContainer& sensors, const Rectangle& fieldBounds)
+{
+    MobilityHelper mobility;
+    mobility.SetPositionAllocator(CreateUniformPositionAllocator(fieldBounds));
+    mobility.SetMobilityModel("ns3::ConstantPositionMobilityModel");
+    mobility.Install(sensors);
+}
+
+static uint32_t
+FindNearestLeader(const Vector& sensorPosition, const NodeContainer& leaders)
+{
+    uint32_t bestLeader = 0;
+    double bestDistance2 = std::numeric_limits<double>::max();
+
+    for (uint32_t i = 0; i < leaders.GetN(); ++i)
+    {
+        const Vector leaderPosition = leaders.Get(i)->GetObject<MobilityModel>()->GetPosition();
+        const double dx = sensorPosition.x - leaderPosition.x;
+        const double dy = sensorPosition.y - leaderPosition.y;
+        const double distance2 = dx * dx + dy * dy;
+
+        if (distance2 < bestDistance2)
+        {
+            bestDistance2 = distance2;
+            bestLeader = i;
+        }
+    }
+
+    return bestLeader;
 }
 
 } // namespace
@@ -107,98 +140,127 @@ int
 main(int argc, char* argv[])
 {
     // -------------------------------------------------------------------------
-    // Parametros de experimento (CommandLine)
+    // Parametros de experimento (primer nivel)
     // -------------------------------------------------------------------------
-    // simTime: tiempo total de simulacion (default 300 s).
-    // agribotSpeed: velocidad maxima para RandomWaypoint de Agribots.
-    // flowmonFile: salida XML de FlowMonitor.
+    // Se modelan 3 clusters de agrobots con movilidad jerarquica:
+    // 1 lider fijo por corrida + seguidores con movimiento relativo.
+    // Sensores estaticos transmiten UDP periodico hacia el lider mas cercano
+    // al inicio de la simulacion.
     //
     // Ejemplo de ejecucion:
-    // ./ns3 run "scratch/adhoc --simTime=300 --agribotSpeed=4.0"
+    // ./ns3 run "adhoc --agrobotsPerCluster=5 --sensorsPerField=24 --simTime=300"
     // -------------------------------------------------------------------------
+    const uint32_t nClusters = 3;
     double simTime = 300.0;
-    double agribotSpeed = 4.0;
-    uint32_t packetSize = 256;
-    std::string appDataRate = "40kbps";
+    uint32_t agrobotsPerCluster = 5;
+    uint32_t sensorsPerField = 24;
+    double fieldWidth = 240.0;
+    double fieldHeight = 180.0;
+    double leaderSpeed = 2.0;
+    double followerSpeedMax = 1.2;
+    double clusterBoxWidth = 30.0;
+    double clusterBoxHeight = 20.0;
+    double sensorInterval = 3.0;
+    uint32_t packetSize = 128;
+    uint32_t rngRun = 1;
     std::string flowmonFile = "flowmon-adhoc.xml";
 
     CommandLine cmd(__FILE__);
-    cmd.AddValue("simTime", "Tiempo de simulacion en segundos (default: 300)", simTime);
-    cmd.AddValue("agribotSpeed",
-                 "Velocidad maxima de Agribots (m/s) para RandomWaypoint",
-                 agribotSpeed);
-    cmd.AddValue("packetSize", "Tamano de paquete UDP (bytes)", packetSize);
-    cmd.AddValue("appDataRate", "Tasa de datos de OnOffApplication (ej. 40kbps)", appDataRate);
+    cmd.AddValue("simTime", "Tiempo total de simulacion en segundos", simTime);
+    cmd.AddValue("agrobotsPerCluster",
+                 "Cantidad de agrobots por cluster (incluye al lider)",
+                 agrobotsPerCluster);
+    cmd.AddValue("sensorsPerField", "Cantidad de sensores estaticos en el campo", sensorsPerField);
+    cmd.AddValue("fieldWidth", "Ancho del campo (m)", fieldWidth);
+    cmd.AddValue("fieldHeight", "Alto del campo (m)", fieldHeight);
+    cmd.AddValue("leaderSpeed", "Velocidad del lider de cluster (m/s)", leaderSpeed);
+    cmd.AddValue("followerSpeedMax",
+                 "Velocidad maxima de seguidores relativa al lider (m/s)",
+                 followerSpeedMax);
+    cmd.AddValue("clusterBoxWidth", "Ancho de la caja local del cluster (m)", clusterBoxWidth);
+    cmd.AddValue("clusterBoxHeight", "Alto de la caja local del cluster (m)", clusterBoxHeight);
+    cmd.AddValue("sensorInterval", "Periodo de envio UDP de los sensores (s)", sensorInterval);
+    cmd.AddValue("packetSize", "Tamano del paquete UDP de sensores (bytes)", packetSize);
+    cmd.AddValue("rngRun", "Indice de corrida RNG para reproducibilidad", rngRun);
     cmd.AddValue("flowmonFile", "Archivo XML de salida para FlowMonitor", flowmonFile);
     cmd.Parse(argc, argv);
+
+    if (agrobotsPerCluster < 1 || sensorsPerField < 1 || simTime <= 5.0 || fieldWidth <= 20.0 ||
+        fieldHeight <= 20.0 || clusterBoxWidth <= 1.0 || clusterBoxHeight <= 1.0 ||
+        sensorInterval <= 0.0)
+    {
+        std::cerr << "Parametros invalidos para el experimento." << std::endl;
+        return 1;
+    }
+
+    RngSeedManager::SetRun(rngRun);
+
+    const uint32_t followersPerCluster = agrobotsPerCluster - 1;
+    const uint32_t totalFollowers = nClusters * followersPerCluster;
+    const uint32_t totalAgrobots = nClusters * agrobotsPerCluster;
+    const Rectangle fieldBounds(0.0, fieldWidth, 0.0, fieldHeight);
+    const Rectangle localBounds(-clusterBoxWidth * 0.5,
+                                clusterBoxWidth * 0.5,
+                                -clusterBoxHeight * 0.5,
+                                clusterBoxHeight * 0.5);
 
     // -------------------------------------------------------------------------
     // NODOS
     // -------------------------------------------------------------------------
-    // Nivel 1 (Agribots): 15 nodos, organizados en 3 clusters logicos de 5 nodos.
-    // Nivel 2 (Tractores/Superhosts): 2 nodos moviles de mayor potencia.
-    // -------------------------------------------------------------------------
-    const uint32_t nAgribots = 15;
-    const uint32_t nClusters = 3;
-    const uint32_t agribotsPerCluster = 5;
-    const uint32_t nTractors = 2;
+    NodeContainer leaders;
+    leaders.Create(nClusters);
 
-    NodeContainer agribots;
-    agribots.Create(nAgribots);
+    NodeContainer followers;
+    followers.Create(totalFollowers);
 
-    NodeContainer tractors;
-    tractors.Create(nTractors);
+    NodeContainer sensors;
+    sensors.Create(sensorsPerField);
 
-    std::vector<NodeContainer> agribotClusters(nClusters);
-    for (uint32_t c = 0; c < nClusters; ++c)
-    {
-        for (uint32_t j = 0; j < agribotsPerCluster; ++j)
-        {
-            agribotClusters[c].Add(agribots.Get(c * agribotsPerCluster + j));
-        }
-    }
+    NodeContainer agrobots;
+    agrobots.Add(leaders);
+    agrobots.Add(followers);
 
     NodeContainer allNodes;
-    allNodes.Add(agribots);
-    allNodes.Add(tractors);
+    allNodes.Add(agrobots);
+    allNodes.Add(sensors);
+
+    std::vector<NodeContainer> clusterMembers(nClusters);
+    std::vector<NodeContainer> clusterFollowers(nClusters);
+    for (uint32_t c = 0; c < nClusters; ++c)
+    {
+        clusterMembers[c].Add(leaders.Get(c));
+        for (uint32_t j = 0; j < followersPerCluster; ++j)
+        {
+            Ptr<Node> follower = followers.Get(c * followersPerCluster + j);
+            clusterFollowers[c].Add(follower);
+            clusterMembers[c].Add(follower);
+        }
+    }
 
     // -------------------------------------------------------------------------
     // MOVILIDAD
     // -------------------------------------------------------------------------
-    // 1) Agribots con RandomWaypoint dentro de 3 zonas rectangulares.
-    // 2) Tractores con WaypointMobilityModel en barridos lineales paralelos.
+    // Lideres: trayectoria global sobre el campo.
+    // Seguidores: movimiento relativo al lider dentro de una caja local.
+    // Sensores: nodos estaticos distribuidos uniformemente en el campo.
     // -------------------------------------------------------------------------
-    const Rectangle zoneA(0.0, 80.0, 0.0, 80.0);
-    const Rectangle zoneB(120.0, 200.0, 0.0, 80.0);
-    const Rectangle zoneC(60.0, 140.0, 100.0, 180.0);
+    MobilityHelper leaderMobility;
+    leaderMobility.SetMobilityModel("ns3::WaypointMobilityModel");
+    leaderMobility.Install(leaders);
+    ConfigureLeaderWaypoints(leaders, simTime, fieldBounds, leaderSpeed);
 
-    InstallAgribotClusterMobility(agribotClusters[0], zoneA, agribotSpeed);
-    InstallAgribotClusterMobility(agribotClusters[1], zoneB, agribotSpeed);
-    InstallAgribotClusterMobility(agribotClusters[2], zoneC, agribotSpeed);
+    for (uint32_t c = 0; c < nClusters; ++c)
+    {
+        InstallFollowerClusterMobility(clusterFollowers[c],
+                                       leaders.Get(c)->GetObject<MobilityModel>(),
+                                       localBounds,
+                                       followerSpeedMax);
+    }
 
-    MobilityHelper tractorMobility;
-    tractorMobility.SetMobilityModel("ns3::WaypointMobilityModel");
-    tractorMobility.Install(tractors);
-
-    const double xMin = 0.0;
-    const double xMax = 200.0;
-    const double yLane0 = 40.0;
-    const double laneSeparation = 90.0;
-    const double legDuration = 25.0;
-    ConfigureTractorWaypoints(tractors,
-                              simTime,
-                              xMin,
-                              xMax,
-                              yLane0,
-                              laneSeparation,
-                              legDuration);
+    InstallSensorMobility(sensors, fieldBounds);
 
     // -------------------------------------------------------------------------
-    // WiFi (802.11g ad-hoc) + AODV
-    // -------------------------------------------------------------------------
-    // Se crea un unico canal ad-hoc y se instalan dispositivos con dos perfiles
-    // PHY: Agribots (potencia base) y Tractores (mayor potencia).
-    // Luego se instala pila IP con AODV en todos los nodos.
+    // WiFi ad-hoc + AODV
     // -------------------------------------------------------------------------
     WifiHelper wifi;
     wifi.SetStandard(WIFI_STANDARD_80211g);
@@ -214,18 +276,18 @@ main(int argc, char* argv[])
     YansWifiChannelHelper channelHelper = YansWifiChannelHelper::Default();
     Ptr<YansWifiChannel> wifiChannel = channelHelper.Create();
 
-    YansWifiPhyHelper agribotPhy;
-    agribotPhy.SetChannel(wifiChannel);
-    agribotPhy.Set("TxPowerStart", DoubleValue(16.0));
-    agribotPhy.Set("TxPowerEnd", DoubleValue(16.0));
+    YansWifiPhyHelper agrobotPhy;
+    agrobotPhy.SetChannel(wifiChannel);
+    agrobotPhy.Set("TxPowerStart", DoubleValue(16.0));
+    agrobotPhy.Set("TxPowerEnd", DoubleValue(16.0));
 
-    YansWifiPhyHelper tractorPhy;
-    tractorPhy.SetChannel(wifiChannel);
-    tractorPhy.Set("TxPowerStart", DoubleValue(23.0));
-    tractorPhy.Set("TxPowerEnd", DoubleValue(23.0));
+    YansWifiPhyHelper sensorPhy;
+    sensorPhy.SetChannel(wifiChannel);
+    sensorPhy.Set("TxPowerStart", DoubleValue(12.0));
+    sensorPhy.Set("TxPowerEnd", DoubleValue(12.0));
 
-    NetDeviceContainer agribotDevices = wifi.Install(agribotPhy, mac, agribots);
-    NetDeviceContainer tractorDevices = wifi.Install(tractorPhy, mac, tractors);
+    NetDeviceContainer agrobotDevices = wifi.Install(agrobotPhy, mac, agrobots);
+    NetDeviceContainer sensorDevices = wifi.Install(sensorPhy, mac, sensors);
 
     AodvHelper aodv;
     InternetStackHelper stack;
@@ -236,60 +298,58 @@ main(int argc, char* argv[])
     ipv4.SetBase("10.1.0.0", "255.255.0.0");
 
     NetDeviceContainer allDevices;
-    allDevices.Add(agribotDevices);
-    allDevices.Add(tractorDevices);
+    allDevices.Add(agrobotDevices);
+    allDevices.Add(sensorDevices);
     Ipv4InterfaceContainer ifaces = ipv4.Assign(allDevices);
 
     // -------------------------------------------------------------------------
-    // TRAFICO UDP (OnOff -> PacketSink)
-    // -------------------------------------------------------------------------
-    // Los 15 agribots generan rafagas UDP y envian a los 2 tractores (round-robin).
-    // Esto modela telemetria periodica bajo conectividad ad-hoc multi-salto.
+    // TRAFICO UDP (sensores -> lideres)
     // -------------------------------------------------------------------------
     const uint16_t sinkPort = 9000;
     ApplicationContainer sinkApps;
-
-    std::vector<Ipv4Address> tractorIps;
-    for (uint32_t i = 0; i < nTractors; ++i)
+    std::vector<Ipv4Address> leaderIps;
+    for (uint32_t i = 0; i < nClusters; ++i)
     {
-        const uint32_t ifaceIndex = nAgribots + i;
-        Ipv4Address tractorIp = ifaces.GetAddress(ifaceIndex);
-        tractorIps.push_back(tractorIp);
+        leaderIps.push_back(ifaces.GetAddress(i));
 
         PacketSinkHelper sinkHelper("ns3::UdpSocketFactory",
                                     InetSocketAddress(Ipv4Address::GetAny(), sinkPort));
-        sinkApps.Add(sinkHelper.Install(tractors.Get(i)));
+        sinkApps.Add(sinkHelper.Install(leaders.Get(i)));
     }
     sinkApps.Start(Seconds(0.5));
     sinkApps.Stop(Seconds(simTime));
 
-    ApplicationContainer onOffApps;
-    for (uint32_t i = 0; i < nAgribots; ++i)
+    std::vector<uint32_t> sensorAssignedLeader(sensorsPerField);
+    std::vector<uint32_t> sensorsPerLeader(nClusters, 0);
+    std::map<uint32_t, uint32_t> sensorIndexByIp;
+
+    for (uint32_t i = 0; i < sensors.GetN(); ++i)
     {
-        const Ipv4Address dst = tractorIps[i % nTractors];
+        const Vector sensorPosition = sensors.Get(i)->GetObject<MobilityModel>()->GetPosition();
+        const uint32_t leaderIndex = FindNearestLeader(sensorPosition, leaders);
+        sensorAssignedLeader[i] = leaderIndex;
+        sensorsPerLeader[leaderIndex]++;
+        sensorIndexByIp.emplace(ifaces.GetAddress(totalAgrobots + i).Get(), i);
+    }
 
-        OnOffHelper onOff("ns3::UdpSocketFactory", Address());
-        onOff.SetAttribute("Remote", AddressValue(InetSocketAddress(dst, sinkPort)));
-        onOff.SetAttribute("PacketSize", UintegerValue(packetSize));
-        onOff.SetAttribute("DataRate", DataRateValue(DataRate(appDataRate)));
-        onOff.SetAttribute("OnTime", StringValue("ns3::ConstantRandomVariable[Constant=1.0]"));
-        onOff.SetAttribute("OffTime", StringValue("ns3::ConstantRandomVariable[Constant=2.0]"));
+    ApplicationContainer sensorApps;
+    for (uint32_t i = 0; i < sensors.GetN(); ++i)
+    {
+        UdpClientHelper client(leaderIps[sensorAssignedLeader[i]], sinkPort);
+        client.SetAttribute("MaxPackets",
+                            UintegerValue(std::numeric_limits<uint32_t>::max()));
+        client.SetAttribute("Interval", TimeValue(Seconds(sensorInterval)));
+        client.SetAttribute("PacketSize", UintegerValue(packetSize));
 
-        ApplicationContainer app = onOff.Install(agribots.Get(i));
-        const double start = 2.0 + 0.2 * static_cast<double>(i);
+        ApplicationContainer app = client.Install(sensors.Get(i));
+        const double start = 2.0 + 0.05 * static_cast<double>(i % 20);
         app.Start(Seconds(start));
         app.Stop(Seconds(simTime - 1.0));
-        onOffApps.Add(app);
+        sensorApps.Add(app);
     }
 
     // -------------------------------------------------------------------------
     // FLOWMONITOR
-    // -------------------------------------------------------------------------
-    // FlowMonitor captura flujos IPv4 para medir:
-    // - PDR de flujos de datos UDP (destino sinkPort)
-    // - Retardo extremo a extremo promedio
-    // - Sobrecarga de enrutamiento aproximada de AODV (puerto UDP 654)
-    // Ademas, exporta un XML para post-procesamiento offline.
     // -------------------------------------------------------------------------
     FlowMonitorHelper flowmonHelper;
     Ptr<FlowMonitor> monitor = flowmonHelper.InstallAll();
@@ -305,54 +365,70 @@ main(int argc, char* argv[])
     uint64_t dataTxPackets = 0;
     uint64_t dataRxPackets = 0;
     uint64_t dataRxDelaySamples = 0;
-    uint64_t routingTxPackets = 0;
     double totalDelaySeconds = 0.0;
+    std::vector<bool> sensorCovered(sensorsPerField, false);
 
     for (const auto& [flowId, st] : stats)
     {
-        Ipv4FlowClassifier::FiveTuple t = classifier->FindFlow(flowId);
-
-        // Trafico de control AODV: UDP puerto 654.
-        const bool isAodvControl = (t.protocol == 17) && (t.sourcePort == 654 || t.destinationPort == 654);
-        if (isAodvControl)
+        const Ipv4FlowClassifier::FiveTuple t = classifier->FindFlow(flowId);
+        const bool isSensorDataFlow = (t.protocol == 17) && (t.destinationPort == sinkPort);
+        if (!isSensorDataFlow)
         {
-            routingTxPackets += st.txPackets;
             continue;
         }
 
-        // Flujos de datos de la aplicacion: UDP cuyo destino es el sinkPort.
-        const bool isDataFlow = (t.protocol == 17) && (t.destinationPort == sinkPort);
-        if (isDataFlow)
+        dataTxPackets += st.txPackets;
+        dataRxPackets += st.rxPackets;
+        totalDelaySeconds += st.delaySum.GetSeconds();
+        dataRxDelaySamples += st.rxPackets;
+
+        auto it = sensorIndexByIp.find(t.sourceAddress.Get());
+        if (it != sensorIndexByIp.end() && st.rxPackets > 0)
         {
-            dataTxPackets += st.txPackets;
-            dataRxPackets += st.rxPackets;
-            totalDelaySeconds += st.delaySum.GetSeconds();
-            dataRxDelaySamples += st.rxPackets;
+            sensorCovered[it->second] = true;
         }
     }
 
-    const double pdr = (dataTxPackets > 0) ? (100.0 * static_cast<double>(dataRxPackets) /
-                                              static_cast<double>(dataTxPackets))
-                                           : 0.0;
+    uint32_t coveredSensors = 0;
+    std::vector<uint32_t> coveredSensorsPerLeader(nClusters, 0);
+    for (uint32_t i = 0; i < sensorCovered.size(); ++i)
+    {
+        if (!sensorCovered[i])
+        {
+            continue;
+        }
 
+        coveredSensors++;
+        coveredSensorsPerLeader[sensorAssignedLeader[i]]++;
+    }
+
+    const double coverage = 100.0 * static_cast<double>(coveredSensors) /
+                            static_cast<double>(sensorsPerField);
+    const double pdr = (dataTxPackets > 0)
+                           ? (100.0 * static_cast<double>(dataRxPackets) /
+                              static_cast<double>(dataTxPackets))
+                           : 0.0;
     const double avgE2eDelay = (dataRxDelaySamples > 0)
                                    ? (totalDelaySeconds / static_cast<double>(dataRxDelaySamples))
                                    : 0.0;
 
-    // Sobrecarga de enrutamiento: paquetes de control AODV por paquete de datos enviado.
-    const double routingOverhead = (dataTxPackets > 0)
-                                       ? (100.0 * static_cast<double>(routingTxPackets) /
-                                          static_cast<double>(dataTxPackets))
-                                       : 0.0;
-
-    std::cout << "\n===== RESULTADOS EXPERIMENTO MANET JERARQUICA =====\n";
-    std::cout << "Tiempo simulacion (s): " << simTime << "\n";
-    std::cout << "Velocidad maxima Agribot (m/s): " << agribotSpeed << "\n";
+    std::cout << "\n===== RESULTADOS PRIMER NIVEL MANET JERARQUICA =====\n";
+    std::cout << "Clusters: " << nClusters << "\n";
+    std::cout << "Agrobots por cluster: " << agrobotsPerCluster << "\n";
+    std::cout << "Total agrobots: " << totalAgrobots << "\n";
+    std::cout << "Sensores estaticos: " << sensorsPerField << "\n";
+    std::cout << "Campo (m): " << fieldWidth << " x " << fieldHeight << "\n";
+    std::cout << "Sensores cubiertos: " << coveredSensors << "/" << sensorsPerField << "\n";
+    std::cout << "Cobertura (%): " << coverage << "\n";
     std::cout << "Paquetes datos TX: " << dataTxPackets << "\n";
     std::cout << "Paquetes datos RX: " << dataRxPackets << "\n";
     std::cout << "PDR (%): " << pdr << "\n";
     std::cout << "Retardo E2E promedio (s): " << avgE2eDelay << "\n";
-    std::cout << "Overhead AODV (% sobre datos TX): " << routingOverhead << "\n";
+    for (uint32_t i = 0; i < nClusters; ++i)
+    {
+        std::cout << "Cluster " << i << " -> sensores asignados: " << sensorsPerLeader[i]
+                  << ", sensores cubiertos: " << coveredSensorsPerLeader[i] << "\n";
+    }
     std::cout << "FlowMonitor XML: " << flowmonFile << "\n";
 
     monitor->SerializeToXmlFile(flowmonFile, true, true);

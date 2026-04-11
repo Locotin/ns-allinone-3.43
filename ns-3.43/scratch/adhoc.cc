@@ -1367,7 +1367,7 @@ main(int argc, char* argv[])
     // Toda la conectividad usa una sola MANET Wi-Fi ad hoc con AODV.
     // El experimento usa exclusivamente store-carry-forward.
     // -------------------------------------------------------------------------
-    double simTime = 101.0;
+    double simTime = 1001.0;
     uint32_t agrobotsPerCluster = 5;
     uint32_t level2NodesPerCluster = 3;
     uint32_t sensorsPerField = 24;

@@ -1,0 +1,14 @@
+*
+
+!.gitignore
+!AGENTS.md
+!scratch/
+scratch/*
+!scratch/adhoc.cc
+!scratch/campaign_plot_utils.py
+!scratch/plot_contact_range_campaign.py
+!scratch/plot_speed_campaign.py
+!scratch/plot_ttl_buffer_campaign.py
+!scratch/run_contact_range_campaign.py
+!scratch/run_speed_campaign.py
+!scratch/run_ttl_buffer_campaign.py

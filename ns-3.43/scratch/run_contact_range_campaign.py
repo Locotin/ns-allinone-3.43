@@ -1,4 +1,41 @@
 #!/usr/bin/env python3
+"""
+run_contact_range_campaign.py
+==============================
+Script de campaña paramétrica para la simulación MANET de agricultura de precisión (adhoc.cc).
+
+Propósito
+---------
+Ejecuta múltiples corridas de ``scratch/adhoc`` variando el parámetro
+``--level1ToLevel2ContactRange`` (rango de contacto entre agrobots y UGVs en metros)
+para estudiar cómo influye la distancia máxima de detección de vecinos en el protocolo
+Store-Carry-Forward (SCF) y en las métricas de red (PDR, delay E2E, AoI, cobertura).
+
+Parámetro barrido
+-----------------
+- ``level1ToLevel2ContactRange``: distancia en metros a partir de la cual dos nodos
+  se consideran "en contacto" para disparar el reenvío SCF.
+  Rango predeterminado: 5 valores equidistantes entre 20 m y 150 m.
+
+Estructura de salida
+--------------------
+``results/contact_range_campaign/<timestamp>/``
+├── manifest.csv          — índice de todas las corridas ejecutadas
+├── raw/
+│   ├── flowmon_<label>.xml      — métricas FlowMonitor por corrida
+│   ├── summary_<label>.csv      — métricas agregadas finales por corrida
+│   └── timeseries_<label>.csv   — series temporales por corrida
+└── logs/
+    └── <label>.log              — salida completa (stdout+stderr) de cada corrida
+
+Uso típico
+----------
+    python3 scratch/run_contact_range_campaign.py
+    python3 scratch/run_contact_range_campaign.py --ranges 30,60,90,120 --runs 5
+    python3 scratch/run_contact_range_campaign.py --skip-build --results-dir /tmp/mi_campaña
+
+El script se ejecuta desde la raíz del repositorio ns-3.43 (donde vive el binario ``./ns3``).
+"""
 
 from __future__ import annotations
 
@@ -26,6 +63,17 @@ MANIFEST_FIELDS = [
 
 
 def parse_args() -> argparse.Namespace:
+    """
+    Parsea los argumentos de línea de comandos.
+
+    Retorna
+    -------
+    argparse.Namespace con los campos:
+      - ranges (str): lista CSV de rangos de contacto en metros.
+      - runs (int): número de semillas aleatorias (rngRun 1..runs) por rango.
+      - results_dir (str | None): directorio de salida; None = auto-timestamp.
+      - skip_build (bool): si True, omite la compilación previa.
+    """
     parser = argparse.ArgumentParser(
         description="Ejecuta una campana de level1ToLevel2ContactRange y guarda los artefactos por corrida."
     )
@@ -53,6 +101,10 @@ def parse_args() -> argparse.Namespace:
 
 
 def parse_ranges(raw_value: str) -> list[float]:
+    """
+    Convierte una cadena CSV de rangos (ej. ``"20.0,52.5,85.0"``) en lista de floats.
+    Si el resultado queda vacío, devuelve los rangos predeterminados.
+    """
     values = []
     for chunk in raw_value.split(","):
         item = chunk.strip()
@@ -63,22 +115,31 @@ def parse_ranges(raw_value: str) -> list[float]:
 
 
 def make_range_slug(value: float) -> str:
+    """Convierte un float a slug seguro para nombres de archivo (ej. ``52.5`` → ``"52_5"``)."""
     return f"{value:.1f}".replace(".", "_")
 
 
 def write_manifest_header(path: Path) -> None:
+    """Crea el archivo manifest.csv con la cabecera de columnas definida en MANIFEST_FIELDS."""
     with path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=MANIFEST_FIELDS)
         writer.writeheader()
 
 
 def append_manifest_row(path: Path, row: dict[str, object]) -> None:
+    """Agrega una fila al manifest.csv con los metadatos de una corrida completada."""
     with path.open("a", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=MANIFEST_FIELDS)
         writer.writerow(row)
 
 
 def ensure_output_dirs(root: Path) -> dict[str, Path]:
+    """
+    Crea la estructura de directorios de salida si no existe.
+
+    Retorna un diccionario con claves ``"root"``, ``"raw"`` y ``"logs"``
+    apuntando a sus respectivos ``Path``.
+    """
     dirs = {
         "root": root,
         "raw": root / "raw",
@@ -90,6 +151,20 @@ def ensure_output_dirs(root: Path) -> dict[str, Path]:
 
 
 def main() -> int:
+    """
+    Punto de entrada principal de la campaña de rango de contacto.
+
+    Flujo de ejecución
+    ------------------
+    1. Parsea argumentos y calcula el directorio de resultados.
+    2. Compila ``scratch/adhoc`` con ``./ns3 build`` (salvo ``--skip-build``).
+    3. Para cada (contact_range × rng_run) ejecuta una corrida de la simulación
+       pasando los parámetros via CLI y redirigiendo stdout/stderr al log.
+    4. Registra cada corrida en manifest.csv en cuanto termina.
+    5. Lanza un error si alguna corrida devuelve código de salida ≠ 0.
+
+    Retorna 0 si todas las corridas terminan con éxito.
+    """
     args = parse_args()
     repo_root = Path(__file__).resolve().parents[1]
     ranges = parse_ranges(args.ranges)

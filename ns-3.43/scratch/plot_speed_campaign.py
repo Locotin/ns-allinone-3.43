@@ -1,4 +1,38 @@
 #!/usr/bin/env python3
+"""
+plot_speed_campaign.py
+=======================
+Script de análisis y visualización para la campaña de velocidad de nodos.
+
+Lee los artefactos generados por ``run_speed_campaign.py``, consolida las métricas
+de todas las corridas y produce un dashboard HTML+SVG autocontenido.
+
+Salidas generadas
+-----------------
+Dentro de ``results/speed_campaign/<timestamp>/``:
+
+``tables/``
+    - ``summary_all_runs.csv``
+        Una fila por corrida con columnas del manifest + summary de adhoc.cc.
+    - ``summary_aggregated_by_speed.csv``
+        Estadísticas descriptivas agrupadas por velocidad (media, std, mín, máx).
+    - ``timeseries_mean_by_speed_time.csv``
+        Series temporales medias por (velocidad, instante).
+
+``plots/``
+    - ``summary_dashboard.svg``
+        Dashboard SVG con 6 paneles (cobertura, delay E2E, PDR por etapa, AoI,
+        ocupación de buffer por capa sensor/agrobot/UGV, drops por TTL por capa).
+    - ``timeseries_dashboard.svg``
+        Dashboard SVG con 3 paneles de series temporales.
+    - ``index.html``
+        Dashboard HTML con hallazgos automáticos, tabla resumen y visualizaciones.
+
+Uso
+---
+    python3 scratch/plot_speed_campaign.py
+    python3 scratch/plot_speed_campaign.py results/speed_campaign/20240101_120000
+"""
 
 from __future__ import annotations
 
@@ -33,6 +67,7 @@ GROUP_FIELD = "follower_speed_max"
 
 
 def parse_args() -> argparse.Namespace:
+    """Parsea el argumento opcional ``results_dir`` (directorio de la campaña a visualizar)."""
     parser = argparse.ArgumentParser(
         description="Consolida y visualiza una carpeta de speed_campaign."
     )
@@ -45,14 +80,17 @@ def parse_args() -> argparse.Namespace:
 
 
 def x_tick_label(speed: float) -> str:
+    """Etiqueta compacta del eje X (sin unidad) para un valor de velocidad."""
     return f"{speed:.1f}"
 
 
 def legend_label(speed: float) -> str:
+    """Etiqueta de leyenda con unidades (ej. ``"10.0 m/s"``) para un valor de velocidad."""
     return f"{speed:.1f} m/s"
 
 
 def run_count_label(aggregated_rows: list[dict[str, str]]) -> str:
+    """Genera una cadena descriptiva del número de corridas por velocidad (para subtítulos)."""
     run_counts = sorted({int(row["runs"]) for row in aggregated_rows})
     if len(run_counts) == 1:
         count = run_counts[0]
@@ -61,6 +99,11 @@ def run_count_label(aggregated_rows: list[dict[str, str]]) -> str:
 
 
 def build_highlight_table(aggregated_rows: list[dict[str, str]]) -> str:
+    """
+    Genera la tabla HTML de resumen con las métricas clave por velocidad.
+
+    Columnas: Velocidad (m/s), Cobertura final (%), Delay E2E (s), AoI (s), PDR Stage 3 (%).
+    """
     headers = ["Velocidad", "Cobertura final", "Delay E2E", "AoI", "PDR Stage 3"]
     rows = []
     for row in aggregated_rows:
@@ -88,6 +131,13 @@ def build_highlight_table(aggregated_rows: list[dict[str, str]]) -> str:
 
 
 def summarize_findings(aggregated_rows: list[dict[str, str]]) -> list[str]:
+    """
+    Genera automáticamente hallazgos textuales a partir de las filas agregadas.
+
+    Identifica la variación total de cobertura entre velocidades, la mejor
+    cobertura, el menor delay E2E y el rango acotado de AoI.
+    Retorna una lista de strings listos para mostrar como ``<li>`` en el dashboard.
+    """
     coverage_means = [float(row["house_coverage_pct_mean"]) for row in aggregated_rows]
     delay_means = [float(row["house_e2e_delay_avg_s_mean"]) for row in aggregated_rows]
     aoi_means = [float(row["house_aoi_avg_s_mean"]) for row in aggregated_rows]
@@ -107,6 +157,20 @@ def render_summary_dashboard(
     aggregated_rows: list[dict[str, str]],
     group_values: list[float],
 ) -> None:
+    """
+    Genera el SVG de métricas finales de la campaña de velocidad.
+
+    Produce un SVG de 1400×1120 px con 6 paneles en cuadrícula 2×3:
+      1. Scatter + media de cobertura final en casa por velocidad.
+      2. Scatter + media de delay E2E por velocidad.
+      3. Barras agrupadas de PDR Stage 2 vs Stage 3.
+      4. Scatter + media de AoI por velocidad.
+      5. Barras de ocupación de buffer (sensor, agrobot, UGV).
+      6. Barras de drops por TTL (sensor, agrobot, UGV).
+
+    Incluye las 3 capas (sensor, agrobot, UGV) a diferencia de la campaña de
+    rango de contacto que solo muestra agrobot y UGV.
+    """
     speed_colors = build_group_color_map(group_values)
     run_values = {
         "coverage": {group_value: [] for group_value in group_values},
@@ -263,6 +327,14 @@ def render_timeseries_dashboard(
     timeseries_rows: list[dict[str, str]],
     group_values: list[float],
 ) -> None:
+    """
+    Genera el SVG de dinámica temporal de la campaña de velocidad.
+
+    Produce un SVG de 1440×520 px con 3 paneles de series temporales:
+      1. Cobertura en casa vs tiempo (media por velocidad).
+      2. Cobertura en agrobots vs tiempo (recepción intermedia).
+      3. AoI promedio vs tiempo (frescura de información).
+    """
     speed_colors = build_group_color_map(group_values)
 
     def metric_series(metric: str) -> dict[float, list[tuple[float, float]]]:
@@ -339,6 +411,12 @@ def render_index_html(
     summary_rows: list[dict[str, str]],
     group_values: list[float],
 ) -> None:
+    """
+    Genera el ``index.html`` del dashboard de la campaña de velocidad.
+
+    Combina hallazgos automáticos, tabla de resumen por velocidad y los SVG de
+    métricas finales y dinámica temporal en un HTML con tarjetas estilizadas.
+    """
     findings = summarize_findings(aggregated_rows)
     speed_summary = ", ".join(legend_label(group_value) for group_value in group_values)
     render_dashboard_index_html(
@@ -362,6 +440,12 @@ def render_index_html(
 
 
 def main() -> int:
+    """
+    Punto de entrada del script de visualización de la campaña de velocidad.
+
+    Flujo: resuelve directorio → lee manifest → une summaries → agrega por velocidad
+    → agrega timeseries → escribe CSVs → genera SVGs → genera index.html.
+    """
     args = parse_args()
     repo_root = Path(__file__).resolve().parents[1]
     results_root = resolve_results_dir(args.results_dir, repo_root, CAMPAIGN_NAME)

@@ -1,4 +1,49 @@
 #!/usr/bin/env python3
+"""
+run_ttl_buffer_campaign.py
+===========================
+Script de campaña paramétrica 2-D que estudia la interacción entre el tiempo de vida
+(TTL) de las muestras y la capacidad del buffer SCF en la simulación MANET de
+agricultura de precisión.
+
+Propósito
+---------
+Ejecuta múltiples corridas de ``scratch/adhoc`` variando simultáneamente dos
+parámetros del protocolo Store-Carry-Forward (SCF):
+
+- ``--sampleTtl``: tiempo de vida en segundos de cada paquete de datos en el
+  buffer SCF. Los paquetes que superan este tiempo son descartados (TTL drop).
+- ``--bufferCapacityPackets``: número máximo de paquetes que puede almacenar
+  cada nodo relay en su buffer SCF.
+
+El cruce factorial de ambos parámetros genera una matriz de experimentos que
+permite observar el compromiso entre frescura de datos (TTL bajo) y retención
+de muestras (buffer grande).
+
+Parámetros barridos
+-------------------
+- TTLs predeterminados: 60 s, 120 s, 240 s
+- Buffers predeterminados: 64, 128, 256 paquetes
+
+Estructura de salida
+--------------------
+``results/ttl_buffer_campaign/<timestamp>/``
+├── manifest.csv
+├── raw/
+│   ├── flowmon_<label>.xml
+│   ├── summary_<label>.csv
+│   └── timeseries_<label>.csv
+└── logs/
+    └── <label>.log
+
+Uso típico
+----------
+    python3 scratch/run_ttl_buffer_campaign.py
+    python3 scratch/run_ttl_buffer_campaign.py --ttls 60,180 --buffers 32,64,128 --runs 5
+    python3 scratch/run_ttl_buffer_campaign.py --skip-build
+
+El script se ejecuta desde la raíz del repositorio ns-3.43.
+"""
 
 from __future__ import annotations
 
@@ -27,6 +72,18 @@ MANIFEST_FIELDS = [
 
 
 def parse_args() -> argparse.Namespace:
+    """
+    Parsea los argumentos de línea de comandos.
+
+    Retorna
+    -------
+    argparse.Namespace con los campos:
+      - ttls (str): lista CSV de TTLs de muestra en segundos.
+      - buffers (str): lista CSV de capacidades de buffer en paquetes.
+      - runs (int): número de semillas aleatorias (rngRun 1..runs) por combinación.
+      - results_dir (str | None): directorio de salida; None = auto-timestamp.
+      - skip_build (bool): si True, omite la compilación previa.
+    """
     parser = argparse.ArgumentParser(
         description="Ejecuta una campana de sampleTtl y bufferCapacityPackets y guarda los artefactos por corrida."
     )
@@ -59,6 +116,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def parse_ttls(raw_value: str) -> list[float]:
+    """Convierte una cadena CSV de TTLs (ej. ``"60.0,120.0,240.0"``) en lista de floats."""
     values = []
     for chunk in raw_value.split(","):
         item = chunk.strip()
@@ -69,6 +127,7 @@ def parse_ttls(raw_value: str) -> list[float]:
 
 
 def parse_buffers(raw_value: str) -> list[int]:
+    """Convierte una cadena CSV de capacidades (ej. ``"64,128,256"``) en lista de enteros."""
     values = []
     for chunk in raw_value.split(","):
         item = chunk.strip()
@@ -79,22 +138,31 @@ def parse_buffers(raw_value: str) -> list[int]:
 
 
 def make_ttl_slug(value: float) -> str:
+    """Convierte un float de TTL a slug seguro para nombres de archivo (ej. ``120.0`` → ``"120_0"``)."""
     return f"{value:.1f}".replace(".", "_")
 
 
 def write_manifest_header(path: Path) -> None:
+    """Crea el archivo manifest.csv con la cabecera de columnas definida en MANIFEST_FIELDS."""
     with path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=MANIFEST_FIELDS)
         writer.writeheader()
 
 
 def append_manifest_row(path: Path, row: dict[str, object]) -> None:
+    """Agrega una fila al manifest.csv con los metadatos de una corrida completada."""
     with path.open("a", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=MANIFEST_FIELDS)
         writer.writerow(row)
 
 
 def ensure_output_dirs(root: Path) -> dict[str, Path]:
+    """
+    Crea la estructura de directorios de salida si no existe.
+
+    Retorna un diccionario con claves ``"root"``, ``"raw"`` y ``"logs"``
+    apuntando a sus respectivos ``Path``.
+    """
     dirs = {
         "root": root,
         "raw": root / "raw",
@@ -106,6 +174,20 @@ def ensure_output_dirs(root: Path) -> dict[str, Path]:
 
 
 def main() -> int:
+    """
+    Punto de entrada principal de la campaña TTL × Buffer.
+
+    Flujo de ejecución
+    ------------------
+    1. Parsea argumentos y valida que TTLs > 0 y buffers ≥ 1.
+    2. Compila ``scratch/adhoc`` con ``./ns3 build`` (salvo ``--skip-build``).
+    3. Para cada (sample_ttl × buffer_capacity × rng_run) ejecuta una corrida
+       pasando los parámetros via CLI y redirigiendo stdout/stderr al log.
+    4. Registra cada corrida en manifest.csv en cuanto termina.
+    5. Lanza un error si alguna corrida devuelve código de salida ≠ 0.
+
+    Retorna 0 si todas las corridas terminan con éxito.
+    """
     args = parse_args()
     repo_root = Path(__file__).resolve().parents[1]
     ttls = parse_ttls(args.ttls)

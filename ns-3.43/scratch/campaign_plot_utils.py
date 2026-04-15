@@ -1,4 +1,54 @@
 #!/usr/bin/env python3
+"""
+campaign_plot_utils.py
+=======================
+Biblioteca compartida de utilidades de análisis estadístico y visualización SVG
+para las campañas paramétricas de la simulación MANET de agricultura de precisión.
+
+Este módulo es importado por los tres scripts de visualización:
+  - ``plot_contact_range_campaign.py``
+  - ``plot_speed_campaign.py``
+  - ``plot_ttl_buffer_campaign.py``
+
+Organización del módulo
+-----------------------
+
+Paleta y tema visual
+    Constantes de colores usadas en todos los dashboards para mantener coherencia
+    visual entre campañas (``CATEGORICAL_PALETTE``, ``DEFAULT_STAGE_COLORS``,
+    ``DEFAULT_LAYER_COLORS``, ``DEFAULT_CASE_COLORS``, ``THEME_*``).
+
+Entrada/Salida de archivos
+    Funciones para localizar directorios de resultados, leer manifests CSV, leer
+    archivos de resumen de corrida individual y escribir CSVs de salida.
+
+Procesamiento estadístico
+    Funciones para combinar filas de resumen con el manifest (``merge_summary_rows``),
+    calcular estadísticas por grupo (media, desv. estándar, mín, máx) sobre corridas
+    múltiples (``aggregate_summary``, ``aggregate_timeseries``).
+
+Generación de HTML
+    Funciones para producir el ``index.html`` del dashboard con tarjetas, tablas de
+    métricas y enlaces a los SVG y CSV generados (``render_dashboard_index_html``,
+    ``build_links_html``, ``build_list_html``).
+
+Primitivas SVG
+    Funciones de bajo nivel para construir elementos SVG sin dependencias externas:
+    ``svg_text``, ``svg_rect``, ``svg_line``, ``svg_circle``, ``svg_polyline``.
+
+Utilidades de escala y coordenadas
+    ``linear_map``: interpolación lineal entre dominios.
+    ``padded_domain``: calcula los límites del eje Y con margen automático.
+    ``spread_offsets``: distribuye puntos de dispersión horizontalmente.
+
+Componentes de panel SVG
+    ``draw_panel_frame``: marco con título y subtítulo para un panel.
+    ``draw_y_axis``: eje Y con líneas de cuadrícula y etiquetas.
+    ``draw_scatter_mean_panel``: scatter de corridas individuales + línea de media.
+    ``draw_grouped_bar_panel``: barras agrupadas por categoría y serie.
+    ``draw_line_panel``: series temporales de líneas múltiples con leyenda.
+    ``draw_heatmap_panel``: mapa de calor 2D con escala de color interpolada.
+"""
 
 from __future__ import annotations
 
@@ -44,6 +94,14 @@ THEME_LINK = CATEGORICAL_PALETTE[3]
 
 
 def newest_campaign_dir(repo_root: Path, campaign_name: str) -> Path:
+    """
+    Encuentra el directorio de campaña más reciente en ``results/<campaign_name>/``.
+
+    El criterio de "más reciente" es el orden lexicográfico del nombre de la
+    subcarpeta (que corresponde a timestamps ``YYYYMMDD_HHMMSS``).
+
+    Lanza ``FileNotFoundError`` si no existe ninguna campaña.
+    """
     base_dir = repo_root / "results" / campaign_name
     candidates = sorted(
         path for path in base_dir.iterdir() if path.is_dir() and (path / "manifest.csv").exists()
@@ -54,12 +112,24 @@ def newest_campaign_dir(repo_root: Path, campaign_name: str) -> Path:
 
 
 def resolve_results_dir(results_dir: str | None, repo_root: Path, campaign_name: str) -> Path:
+    """
+    Resuelve el directorio de resultados a usar.
+
+    Si ``results_dir`` es una cadena no vacía, la convierte a ``Path`` absoluto.
+    Si es ``None``, delega en ``newest_campaign_dir`` para usar la campaña más reciente.
+    """
     if results_dir:
         return Path(results_dir).expanduser().resolve()
     return newest_campaign_dir(repo_root, campaign_name)
 
 
 def ensure_output_dirs(results_root: Path) -> dict[str, Path]:
+    """
+    Crea los subdirectorios de salida para tablas y gráficas dentro de la campaña.
+
+    Retorna un diccionario con claves ``"root"``, ``"tables"`` y ``"plots"``.
+    Los directorios se crean si no existen (``parents=True, exist_ok=True``).
+    """
     dirs = {
         "root": results_root,
         "tables": results_root / "tables",
@@ -71,6 +141,13 @@ def ensure_output_dirs(results_root: Path) -> dict[str, Path]:
 
 
 def resolve_artifact_path(results_root: Path, raw_path: str) -> Path:
+    """
+    Convierte la ruta de un artefacto registrada en el manifest a un ``Path`` absoluto.
+
+    Si ``raw_path`` ya es absoluto lo devuelve tal cual; si es relativo, lo une
+    con ``results_root``. Esto permite que el manifest funcione correctamente
+    aunque los archivos se hayan generado en una máquina diferente.
+    """
     path = Path(raw_path)
     if path.is_absolute():
         return path
@@ -78,12 +155,23 @@ def resolve_artifact_path(results_root: Path, raw_path: str) -> Path:
 
 
 def read_manifest(results_root: Path) -> list[dict[str, str]]:
+    """
+    Lee el ``manifest.csv`` de una carpeta de resultados de campaña.
+
+    Retorna una lista de diccionarios, uno por corrida, con los campos del manifest.
+    """
     manifest_path = results_root / "manifest.csv"
     with manifest_path.open(newline="", encoding="utf-8") as handle:
         return list(csv.DictReader(handle))
 
 
 def read_single_row_csv(path: Path) -> dict[str, str]:
+    """
+    Lee un CSV que contiene exactamente una fila de datos (más cabecera).
+
+    Lanza ``ValueError`` si el archivo tiene cero o más de una fila de datos.
+    Usado para leer los archivos ``summary_<label>.csv`` producidos por adhoc.cc.
+    """
     with path.open(newline="", encoding="utf-8") as handle:
         rows = list(csv.DictReader(handle))
     if len(rows) != 1:
@@ -92,6 +180,7 @@ def read_single_row_csv(path: Path) -> dict[str, str]:
 
 
 def is_float(value: str) -> bool:
+    """Retorna ``True`` si ``value`` puede convertirse a ``float`` sin error."""
     try:
         float(value)
         return True
@@ -100,10 +189,18 @@ def is_float(value: str) -> bool:
 
 
 def format_float(value: float, digits: int = 6) -> str:
+    """Formatea un float con un número fijo de decimales para almacenamiento en CSV."""
     return f"{value:.{digits}f}"
 
 
 def format_metric_value(metric: str, value: float) -> str:
+    """
+    Formatea un valor de métrica con la unidad apropiada según su nombre.
+
+    - Sufijo ``_pct`` → porcentaje con dos decimales (ej. ``"87.34%"``).
+    - Sufijo ``_s`` → segundos con dos decimales (ej. ``"12.50 s"``).
+    - Cualquier otro → dos decimales sin unidad.
+    """
     if metric.endswith("_pct"):
         return f"{value:.2f}%"
     if metric.endswith("_s"):
@@ -112,6 +209,12 @@ def format_metric_value(metric: str, value: float) -> str:
 
 
 def compact_label(value: float, digits_if_needed: int = 1) -> str:
+    """
+    Devuelve una etiqueta compacta para un valor numérico en ejes y leyendas.
+
+    Si el valor es prácticamente un entero lo muestra sin decimales (ej. ``52``).
+    Si tiene parte fraccionaria relevante, usa ``digits_if_needed`` decimales.
+    """
     rounded = round(value)
     if math.isclose(value, rounded):
         return str(int(rounded))
@@ -119,6 +222,12 @@ def compact_label(value: float, digits_if_needed: int = 1) -> str:
 
 
 def build_group_color_map(group_values: list[float]) -> dict[str, str]:
+    """
+    Asigna un color de la paleta categórica a cada valor de grupo único.
+
+    La clave del diccionario es el valor formateado con un decimal (ej. ``"52.5"``).
+    Los colores se asignan en orden creciente y se reciclan si hay más grupos que colores.
+    """
     ordered = sorted(set(group_values))
     return {
         format_float(group_value, 1): CATEGORICAL_PALETTE[index % len(CATEGORICAL_PALETTE)]
@@ -131,6 +240,29 @@ def merge_summary_rows(
     manifest_rows: list[dict[str, str]],
     group_field: str,
 ) -> tuple[list[dict[str, str]], list[str], list[float]]:
+    """
+    Une las filas del manifest con los archivos ``summary_<label>.csv`` de cada corrida.
+
+    Por cada fila del manifest, lee el CSV de resumen correspondiente y agrega sus
+    columnas a la fila del manifest (sin sobreescribir columnas existentes).
+
+    Parámetros
+    ----------
+    results_root : Path
+        Raíz del directorio de la campaña.
+    manifest_rows : list[dict]
+        Filas del manifest.csv (leídas por ``read_manifest``).
+    group_field : str
+        Nombre de la columna que identifica el grupo experimental
+        (ej. ``"contact_range"`` o ``"follower_speed_max"``).
+
+    Retorna
+    -------
+    Tupla de tres elementos:
+      - all_rows: filas combinadas manifest + summary, una por corrida.
+      - summary_fields: nombres de columnas que vienen del summary CSV.
+      - group_values: lista ordenada y deduplicada de los valores del grupo.
+    """
     all_rows: list[dict[str, str]] = []
     summary_fields: list[str] = []
     group_values: list[float] = []
@@ -156,6 +288,7 @@ def merge_summary_rows(
 
 
 def write_csv(path: Path, fieldnames: list[str], rows: list[dict[str, str]]) -> None:
+    """Escribe una lista de diccionarios como CSV con cabecera en ``path``."""
     with path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
@@ -163,6 +296,14 @@ def write_csv(path: Path, fieldnames: list[str], rows: list[dict[str, str]]) -> 
 
 
 def build_links_html(links: list[tuple[str, str]]) -> str:
+    """
+    Genera un bloque HTML ``<div class="links">`` con enlaces.
+
+    Parámetros
+    ----------
+    links : list of (label, href)
+        Cada tupla produce un ``<a>`` con el texto ``label`` apuntando a ``href``.
+    """
     parts = ['<div class="links">']
     for label, href in links:
         parts.append(f'<a href="{html.escape(href, quote=True)}">{html.escape(label)}</a>')
@@ -171,6 +312,7 @@ def build_links_html(links: list[tuple[str, str]]) -> str:
 
 
 def build_list_html(items: list[str]) -> str:
+    """Genera una lista HTML ``<ul>`` con un ``<li>`` por cada elemento de ``items``."""
     return "<ul>" + "".join(f"<li>{html.escape(item)}</li>" for item in items) + "</ul>"
 
 
@@ -184,6 +326,33 @@ def render_dashboard_index_html(
     sections: list[tuple[str, str]],
     table_max_width: int = 760,
 ) -> None:
+    """
+    Genera el archivo ``index.html`` del dashboard de una campaña.
+
+    El HTML usa un diseño de tarjetas (``<div class="card">``) con CSS embebido
+    compatible con la paleta del proyecto. La primera tarjeta actúa como encabezado
+    con la ruta de origen, texto resumen y enlaces a CSVs; las siguientes tarjetas
+    contienen las secciones de análisis (hallazgos, tablas, imágenes SVG).
+
+    Parámetros
+    ----------
+    output_path : Path
+        Ruta de escritura del archivo ``index.html``.
+    document_title : str
+        Título del documento HTML (aparece en la pestaña del navegador).
+    page_heading : str
+        Encabezado principal ``<h1>`` de la primera tarjeta.
+    source_path : Path
+        Ruta a la carpeta de resultados de la campaña (informativa).
+    summary_text : str
+        Párrafo de resumen de la campaña (número de corridas, parámetros, etc.).
+    links : list of (label, href)
+        Pares (etiqueta, ruta relativa) de los CSVs de salida.
+    sections : list of (title, html_body)
+        Cada sección produce una tarjeta ``<h2>`` + contenido HTML arbitrario.
+    table_max_width : int
+        Ancho máximo en píxeles de las tablas de métricas.
+    """
     cards = [
         (
             page_heading,
@@ -274,6 +443,15 @@ def aggregate_summary(
     group_field: str,
     group_values: list[float],
 ) -> tuple[list[dict[str, str]], list[str]]:
+    """
+    Calcula estadísticas descriptivas de las métricas de resumen agrupando por ``group_field``.
+
+    Para cada valor de grupo calcula media, desviación estándar, mínimo y máximo
+    de cada campo numérico del summary (excluye ``run_label`` y ``rng_run``).
+
+    Retorna una tupla (aggregated_rows, fieldnames) donde cada fila de
+    ``aggregated_rows`` corresponde a un único valor de grupo y sus estadísticas.
+    """
     numeric_fields = [
         field
         for field in summary_fields
@@ -311,6 +489,14 @@ def aggregate_timeseries(
     group_field: str,
     group_values: list[float],
 ) -> tuple[list[dict[str, str]], list[str]]:
+    """
+    Lee los archivos ``timeseries_<label>.csv`` de cada corrida y los agrega por
+    (grupo, instante de tiempo), calculando media, desv. estándar, mínimo y máximo.
+
+    Resultado: una fila por combinación ``(group_value, time_s)`` con las
+    estadísticas de todas las corridas del grupo en ese instante.
+    Útil para trazar series temporales promediadas sobre múltiples semillas.
+    """
     grouped: dict[tuple[float, float], dict[str, list[float]]] = defaultdict(lambda: defaultdict(list))
     timeseries_fields: list[str] = []
 
@@ -356,6 +542,12 @@ def aggregate_timeseries(
 
 
 def wrap_text_lines(text: str | None, max_chars: int) -> list[str]:
+    """
+    Divide un texto en líneas que no excedan ``max_chars`` caracteres.
+
+    Respeta los saltos de línea originales y realiza word-wrap sin cortar palabras.
+    Retorna lista vacía si ``text`` es ``None`` o vacío.
+    """
     if not text:
         return []
     lines: list[str] = []
@@ -385,6 +577,7 @@ def svg_text(
     fill: str = "#0f172a",
     anchor: str = "start",
 ) -> str:
+    """Genera un elemento SVG ``<text>`` con la fuente y estilo del tema del proyecto."""
     return (
         f'<text x="{x:.1f}" y="{y:.1f}" font-size="{size}" font-weight="{weight}" '
         f'fill="{fill}" text-anchor="{anchor}" font-family="Verdana, Geneva, sans-serif">{html.escape(text)}</text>'
@@ -401,6 +594,7 @@ def svg_rect(
     stroke_width: float = 1.0,
     rx: float = 0.0,
 ) -> str:
+    """Genera un elemento SVG ``<rect>`` con esquinas redondeadas opcionales (``rx``)."""
     return (
         f'<rect x="{x:.1f}" y="{y:.1f}" width="{width:.1f}" height="{height:.1f}" '
         f'fill="{fill}" stroke="{stroke}" stroke-width="{stroke_width:.1f}" rx="{rx:.1f}" />'
@@ -416,6 +610,7 @@ def svg_line(
     stroke_width: float = 2.0,
     dash: str | None = None,
 ) -> str:
+    """Genera un elemento SVG ``<line>``. Si ``dash`` no es ``None`` aplica ``stroke-dasharray``."""
     dash_attr = f' stroke-dasharray="{dash}"' if dash else ""
     return (
         f'<line x1="{x1:.1f}" y1="{y1:.1f}" x2="{x2:.1f}" y2="{y2:.1f}" '
@@ -432,6 +627,7 @@ def svg_circle(
     stroke_width: float = 1.0,
     opacity: float = 1.0,
 ) -> str:
+    """Genera un elemento SVG ``<circle>`` con opacidad configurable."""
     return (
         f'<circle cx="{cx:.1f}" cy="{cy:.1f}" r="{radius:.1f}" fill="{fill}" '
         f'stroke="{stroke}" stroke-width="{stroke_width:.1f}" opacity="{opacity:.3f}" />'
@@ -439,6 +635,7 @@ def svg_circle(
 
 
 def svg_polyline(points: list[tuple[float, float]], stroke: str, stroke_width: float = 2.5, fill: str = "none") -> str:
+    """Genera un elemento SVG ``<polyline>`` con uniones y extremos redondeados."""
     serialized = " ".join(f"{x:.1f},{y:.1f}" for x, y in points)
     return (
         f'<polyline points="{serialized}" stroke="{stroke}" stroke-width="{stroke_width:.1f}" '
@@ -447,6 +644,13 @@ def svg_polyline(points: list[tuple[float, float]], stroke: str, stroke_width: f
 
 
 def linear_map(value: float, domain_min: float, domain_max: float, range_min: float, range_max: float) -> float:
+    """
+    Interpola linealmente ``value`` del dominio ``[domain_min, domain_max]``
+    al rango ``[range_min, range_max]``.
+
+    Si ``domain_min == domain_max`` devuelve el punto medio del rango para evitar
+    división por cero.  Usado para convertir valores de datos a coordenadas SVG.
+    """
     if math.isclose(domain_min, domain_max):
         return (range_min + range_max) * 0.5
     ratio = (value - domain_min) / (domain_max - domain_min)
@@ -454,6 +658,13 @@ def linear_map(value: float, domain_min: float, domain_max: float, range_min: fl
 
 
 def padded_domain(values: list[float], min_floor: float | None = None, max_ceiling: float | None = None) -> tuple[float, float]:
+    """
+    Calcula los límites del eje Y con un margen automático del 12 % del rango de datos.
+
+    Parámetros opcionales ``min_floor`` y ``max_ceiling`` imponen límites duros
+    (p. ej., ``min_floor=0.0`` para métricas no negativas). Si los datos son
+    constantes, añade un margen fijo para que el eje no colapse.
+    """
     data_min = min(values)
     data_max = max(values)
     if min_floor is not None:
@@ -474,10 +685,17 @@ def padded_domain(values: list[float], min_floor: float | None = None, max_ceili
 
 
 def color_for_group(color_map: dict[str, str], group_value: float) -> str:
+    """Devuelve el color asignado a ``group_value`` en el mapa, o gris neutro si no existe."""
     return color_map.get(format_float(group_value, 1), "#475569")
 
 
 def spread_offsets(count: int, max_spread: float) -> list[float]:
+    """
+    Genera ``count`` desplazamientos horizontales simétricos dentro de ``[-max_spread, +max_spread]``.
+
+    Usado en ``draw_scatter_mean_panel`` para evitar que los puntos de corridas
+    individuales se solapén exactamente (jitter manual sin aleatoriedad).
+    """
     if count <= 1:
         return [0.0]
     if count == 2:
@@ -497,6 +715,14 @@ def draw_panel_frame(
     subtitle: str | None = None,
     footer_height: float = 58.0,
 ) -> tuple[list[str], tuple[float, float, float, float, float]]:
+    """
+    Dibuja el marco de un panel SVG con título, subtítulo y área de trazado.
+
+    Retorna una tupla ``(items, geometry)`` donde:
+    - ``items`` es la lista de strings SVG del marco (fondo, título, subtítulo).
+    - ``geometry`` es ``(plot_left, plot_top, plot_width, plot_height, footer_top)``
+      que el llamador usa para posicionar el contenido del panel.
+    """
     items = [
         svg_rect(x, y, width, height, fill="#ffffff", stroke="#cbd5e1", stroke_width=1.0, rx=14.0),
     ]
@@ -530,6 +756,18 @@ def draw_y_axis(
     tick_count: int = 5,
     percent: bool = False,
 ) -> list[str]:
+    """
+    Genera las líneas de cuadrícula horizontal, el eje Y vertical y las etiquetas numéricas.
+
+    Parámetros
+    ----------
+    domain : tuple (y_min, y_max)
+        Rango visible del eje Y.
+    tick_count : int
+        Número de marcas/líneas de cuadrícula equidistantes.
+    percent : bool
+        Si ``True``, las etiquetas llevan el sufijo ``%``.
+    """
     items = []
     y_min, y_max = domain
     for tick in range(tick_count):
@@ -557,6 +795,28 @@ def draw_scatter_mean_panel(
     x_label_formatter,
     percent: bool = False,
 ) -> str:
+    """
+    Genera un panel SVG de dispersión con línea de media superpuesta.
+
+    Cada punto representa el valor final de una corrida individual; la línea
+    negra conecta las medias de cada grupo.  Los puntos del mismo grupo se
+    dispersan horizontalmente (jitter simétrico) para mejorar la legibilidad.
+
+    Parámetros
+    ----------
+    group_values : list[float]
+        Valores del parámetro que define el eje X (ej. rangos de contacto).
+    run_values : dict[float → list[float]]
+        Valores por corrida para cada grupo.
+    means : dict[float → float]
+        Media precalculada para cada grupo.
+    color_map : dict[str → str]
+        Mapa de ``format_float(group_value, 1)`` a color hexadecimal.
+    x_label_formatter : callable(float) → str
+        Función que convierte un valor de grupo a etiqueta del eje X.
+    percent : bool
+        Si ``True``, el eje Y va de 0 a 100 % fijo.
+    """
     panel, (plot_left, plot_top, plot_width, plot_height, _) = draw_panel_frame(
         x, y, width, height, title, subtitle, footer_height=46.0
     )
@@ -615,6 +875,19 @@ def draw_grouped_bar_panel(
     x_label_formatter,
     percent: bool = False,
 ) -> str:
+    """
+    Genera un panel SVG de barras agrupadas por grupo y serie (ej. Stage 2 vs Stage 3).
+
+    Parámetros
+    ----------
+    series : list of (label, color, values_dict)
+        Cada elemento define una serie: su leyenda textual, color hexadecimal
+        y un dict ``{group_value: bar_height}``.
+    x_label_formatter : callable(float) → str
+        Función que convierte un valor de grupo a etiqueta del eje X.
+    percent : bool
+        Si ``True``, el eje Y va de 0 a 100 % fijo.
+    """
     panel, (plot_left, plot_top, plot_width, plot_height, footer_top) = draw_panel_frame(
         x, y, width, height, title, subtitle, footer_height=72.0
     )
@@ -668,6 +941,27 @@ def draw_line_panel(
     series_label_formatter,
     percent: bool = False,
 ) -> str:
+    """
+    Genera un panel SVG de series temporales (líneas múltiples).
+
+    Cada clave de ``series`` identifica un grupo o caso; su valor es una lista de
+    puntos ``(time_s, metric_value)`` ya ordenados por tiempo.  Cada serie se dibuja
+    como una polilínea con un punto marcador al final.  La leyenda se adapta
+    automáticamente en columnas según el número de series y la longitud de las
+    etiquetas.
+
+    Parámetros
+    ----------
+    series : dict[float → list[(time_s, value)]]
+        Clave: identificador numérico del grupo.  Valor: lista de puntos temporales.
+    color_map : dict[str → str]
+        Mapa de ``format_float(group_value, 1)`` a color hexadecimal.
+    series_label_formatter : callable(float) → str
+        Función que convierte un identificador de grupo a etiqueta de leyenda.
+    percent : bool
+        Si ``True``, el eje Y va de 0 a 100 % fijo; de lo contrario se calcula
+        automáticamente con ``padded_domain``.
+    """
     group_values = sorted(series)
     legend_labels = [series_label_formatter(group_value) for group_value in group_values]
     longest_label = max((len(label) for label in legend_labels), default=0)
@@ -728,15 +1022,24 @@ def draw_line_panel(
 
 
 def hex_to_rgb(color: str) -> tuple[int, int, int]:
+    """Convierte un color hexadecimal ``"#rrggbb"`` a tupla ``(r, g, b)`` de enteros."""
     color = color.lstrip("#")
     return tuple(int(color[index:index + 2], 16) for index in (0, 2, 4))
 
 
 def rgb_to_hex(rgb: tuple[int, int, int]) -> str:
+    """Convierte una tupla ``(r, g, b)`` de enteros a color hexadecimal ``"#rrggbb"``."""
     return "#" + "".join(f"{max(0, min(255, channel)):02x}" for channel in rgb)
 
 
 def interpolate_color(color_start: str, color_end: str, ratio: float) -> str:
+    """
+    Interpola linealmente entre dos colores hexadecimales.
+
+    ``ratio=0.0`` devuelve ``color_start``; ``ratio=1.0`` devuelve ``color_end``.
+    El valor se fija al rango [0, 1] antes de interpolar.
+    Usado para construir la escala de color continua del heatmap.
+    """
     start = hex_to_rgb(color_start)
     end = hex_to_rgb(color_end)
     clamped = max(0.0, min(1.0, ratio))
@@ -748,6 +1051,13 @@ def interpolate_color(color_start: str, color_end: str, ratio: float) -> str:
 
 
 def heatmap_fill(value: float, domain_min: float, domain_max: float) -> str:
+    """
+    Devuelve el color de relleno para una celda del heatmap según la posición de
+    ``value`` en ``[domain_min, domain_max]``.
+
+    Usa la escala ``HEATMAP_LOW_COLOR`` → ``HEATMAP_HIGH_COLOR``.
+    Si el dominio es constante asigna el color del punto medio.
+    """
     if math.isclose(domain_min, domain_max):
         ratio = 0.5
     else:
@@ -756,6 +1066,13 @@ def heatmap_fill(value: float, domain_min: float, domain_max: float) -> str:
 
 
 def ideal_text_color(fill: str) -> str:
+    """
+    Calcula el color de texto óptimo (oscuro o claro) para garantizar contraste
+    legible sobre un fondo de color ``fill``.
+
+    Usa la fórmula de luminancia relativa WCAG.  Devuelve ``"#0f172a"`` (oscuro)
+    para fondos claros y ``"#f8fafc"`` (claro) para fondos oscuros.
+    """
     red, green, blue = hex_to_rgb(fill)
     luminance = (0.2126 * red + 0.7152 * green + 0.0722 * blue) / 255.0
     return "#0f172a" if luminance > 0.62 else "#f8fafc"
@@ -776,6 +1093,33 @@ def draw_heatmap_panel(
     metric: str,
     percent: bool = False,
 ) -> str:
+    """
+    Genera un panel SVG de mapa de calor (heatmap) bidimensional.
+
+    Diseñado para la campaña TTL × Buffer donde las filas representan valores
+    de TTL y las columnas representan capacidades de buffer.  Cada celda se
+    colorea con una escala continua interpolada y muestra el valor numérico
+    centrado con contraste automático de texto.  Incluye una barra de escala
+    de color en el footer del panel.
+
+    Parámetros
+    ----------
+    row_values : list[float]
+        Valores únicos del parámetro de filas (TTL en segundos), ordenados.
+    column_values : list[int]
+        Valores únicos del parámetro de columnas (buffer en paquetes), ordenados.
+    values : dict[(ttl, buffer) → float]
+        Valor de la métrica para cada combinación (TTL, buffer).
+    row_label_formatter : callable(float) → str
+        Convierte un valor de TTL a etiqueta de fila (ej. ``"120 s"``).
+    column_label_formatter : callable(int) → str
+        Convierte una capacidad de buffer a etiqueta de columna (ej. ``"128"``).
+    metric : str
+        Nombre de la métrica; determina el formato del valor en la celda
+        (``_pct`` → porcentaje, ``_s`` → segundos, resto → número genérico).
+    percent : bool
+        Si ``True``, las etiquetas de la barra de escala llevan sufijo ``%``.
+    """
     panel, (plot_left, plot_top, plot_width, plot_height, footer_top) = draw_panel_frame(
         x, y, width, height, title, subtitle, footer_height=74.0
     )

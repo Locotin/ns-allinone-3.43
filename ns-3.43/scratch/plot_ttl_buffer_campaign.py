@@ -1,4 +1,46 @@
 #!/usr/bin/env python3
+"""
+plot_ttl_buffer_campaign.py
+============================
+Script de análisis y visualización para la campaña factorial TTL × Buffer.
+
+Lee los artefactos generados por ``run_ttl_buffer_campaign.py``, consolida las
+métricas de todas las corridas y produce un dashboard HTML+SVG autocontenido
+con heatmaps bidimensionales y series temporales de casos representativos.
+
+Diferencias respecto a las otras campañas
+-----------------------------------------
+Esta campaña varía **dos** parámetros simultáneamente (TTL y buffer), por lo que:
+  - La agregación es bidimensional: ``aggregate_summary_2d`` y ``aggregate_timeseries_2d``
+    agrupan por la clave compuesta ``(sample_ttl_s, buffer_capacity_packets)``.
+  - La visualización principal usa heatmaps en lugar de scatter/barras.
+  - Para las series temporales se seleccionan automáticamente hasta 3 "casos
+    representativos" (mejor cobertura, referencia y menor cobertura) usando
+    ``select_cases`` y ``build_unique_case_rows``.
+
+Salidas generadas
+-----------------
+Dentro de ``results/ttl_buffer_campaign/<timestamp>/``:
+
+``tables/``
+    - ``summary_all_runs.csv``
+    - ``summary_aggregated_by_ttl_buffer.csv``
+    - ``timeseries_mean_selected_cases.csv``
+
+``plots/``
+    - ``heatmaps_dashboard.svg``
+        9 heatmaps en cuadrícula 3×3 (cobertura, delay, AoI, drops TTL por capa,
+        ocupación de buffer por capa).
+    - ``timeseries_dashboard.svg``
+        2 paneles de series temporales para los casos seleccionados.
+    - ``index.html``
+        Dashboard HTML completo.
+
+Uso
+---
+    python3 scratch/plot_ttl_buffer_campaign.py
+    python3 scratch/plot_ttl_buffer_campaign.py results/ttl_buffer_campaign/20240101_120000
+"""
 
 from __future__ import annotations
 
@@ -36,6 +78,7 @@ BUFFER_FIELD = "buffer_capacity_packets"
 
 
 def parse_args() -> argparse.Namespace:
+    """Parsea el argumento opcional ``results_dir`` (directorio de la campaña a visualizar)."""
     parser = argparse.ArgumentParser(
         description="Consolida y visualiza una carpeta de ttl_buffer_campaign."
     )
@@ -48,14 +91,17 @@ def parse_args() -> argparse.Namespace:
 
 
 def ttl_label(ttl: float) -> str:
+    """Formatea un TTL en segundos como etiqueta compacta (ej. ``120.0`` → ``"120 s"``)."""
     return f"{ttl:.0f} s" if math.isclose(ttl, round(ttl)) else f"{ttl:.1f} s"
 
 
 def buffer_label(buffer_capacity: int) -> str:
+    """Convierte una capacidad de buffer a cadena de texto (ej. ``128`` → ``"128"``)."""
     return str(buffer_capacity)
 
 
 def case_label(ttl: float, buffer_capacity: int) -> str:
+    """Etiqueta combinada de un caso TTL+Buffer (ej. ``"TTL 120 s / Buf 128"``)."""
     return f"TTL {ttl_label(ttl)} / Buf {buffer_capacity}"
 
 
@@ -63,6 +109,20 @@ def merge_summary_rows_2d(
     results_root: Path,
     manifest_rows: list[dict[str, str]],
 ) -> tuple[list[dict[str, str]], list[str], list[float], list[int]]:
+    """
+    Une el manifest con los archivos ``summary_<label>.csv`` para la campaña 2D.
+
+    Versión especializada de ``merge_summary_rows`` que extrae y retorna
+    dos listas de valores únicos: ``ttl_values`` (floats) y ``buffer_values`` (ints).
+
+    Retorna
+    -------
+    Tupla de cuatro elementos:
+      - all_rows: filas combinadas manifest + summary.
+      - summary_fields: columnas del summary CSV.
+      - ttl_values: lista ordenada de TTLs únicos.
+      - buffer_values: lista ordenada de capacidades de buffer únicas.
+    """
     all_rows: list[dict[str, str]] = []
     summary_fields: list[str] = []
     ttl_values: set[float] = set()
@@ -94,6 +154,13 @@ def aggregate_summary_2d(
     ttl_values: list[float],
     buffer_values: list[int],
 ) -> tuple[list[dict[str, str]], list[str]]:
+    """
+    Calcula estadísticas descriptivas agrupando por la clave compuesta (TTL, buffer).
+
+    Para cada combinación (ttl, buffer) calcula media, desv. estándar, mínimo y
+    máximo de cada métrica numérica sobre todas las corridas del grupo.
+    Retorna (aggregated_rows, fieldnames).
+    """
     numeric_fields = [
         field
         for field in summary_fields
@@ -133,6 +200,13 @@ def aggregate_timeseries_2d(
     results_root: Path,
     manifest_rows: list[dict[str, str]],
 ) -> tuple[list[dict[str, str]], list[str]]:
+    """
+    Lee los archivos ``timeseries_<label>.csv`` y los agrega por (TTL, buffer, time_s).
+
+    Produce una fila por combinación ``(ttl, buffer, instante)`` con la media y
+    estadísticas de todas las corridas del grupo en ese instante de tiempo.
+    Retorna (aggregated_rows, fieldnames).
+    """
     grouped: dict[tuple[float, int, float], dict[str, list[float]]] = defaultdict(lambda: defaultdict(list))
     timeseries_fields: list[str] = []
 
@@ -178,6 +252,12 @@ def aggregate_timeseries_2d(
 
 
 def build_highlight_table(aggregated_rows: list[dict[str, str]]) -> str:
+    """
+    Genera la tabla HTML de resumen con métricas clave por combinación (TTL, buffer).
+
+    Columnas: TTL (s), Buffer (paquetes), Cobertura final (%), Delay E2E (s),
+    AoI (s), TTL drops en sensores.
+    """
     headers = ["TTL", "Buffer", "Cobertura final", "Delay E2E", "AoI", "TTL drops sensor"]
     parts = ['<table class="metric-table"><thead><tr>']
     for header in headers:
@@ -203,6 +283,13 @@ def build_highlight_table(aggregated_rows: list[dict[str, str]]) -> str:
 
 
 def select_reference_case(aggregated_rows: list[dict[str, str]], reserved_keys: set[tuple[float, int]]) -> tuple[float, int]:
+    """
+    Selecciona un caso "de referencia" para las series temporales del dashboard.
+
+    Primero intenta usar ``(TTL=120, buffer=128)`` como caso de referencia canónico.
+    Si ya está reservado (best o worst), selecciona la combinación con cobertura
+    más cercana a la mediana del grupo y parámetros más próximos al punto canónico.
+    """
     preferred_key = (120.0, 128)
     available_keys = [
         (float(row[TTL_FIELD]), int(float(row[BUFFER_FIELD])))
@@ -235,6 +322,13 @@ def build_timeseries_signature(
     timeseries_rows: list[dict[str, str]],
     case_key: tuple[float, int],
 ) -> tuple[tuple[float, float, float], ...]:
+    """
+    Construye una firma hashable de la serie temporal de un caso (TTL, buffer).
+
+    La firma es una tupla de tripletes ``(time_s, coverage_mean, aoi_mean)``
+    ordenados por tiempo.  Permite detectar combinaciones que producen
+    comportamientos idénticos y evitar mostrar curvas duplicadas en el dashboard.
+    """
     ttl_value, buffer_value = case_key
     rows = [
         row
@@ -257,6 +351,13 @@ def build_unique_case_rows(
     aggregated_rows: list[dict[str, str]],
     timeseries_rows: list[dict[str, str]],
 ) -> list[dict[str, str]]:
+    """
+    Filtra las combinaciones (TTL, buffer) que producen comportamientos temporales únicos.
+
+    Agrupa las combinaciones por su firma de serie temporal; dentro de cada grupo
+    elige la combinación "canónica" preferiendo ``(120, 128)`` y luego la de mayor
+    cobertura.  Retorna la lista de filas únicas ordenadas por cobertura ascendente.
+    """
     preferred_key = (120.0, 128)
     rows_by_key = {
         (float(row[TTL_FIELD]), int(float(row[BUFFER_FIELD]))): row
@@ -297,6 +398,20 @@ def select_cases(
     aggregated_rows: list[dict[str, str]],
     timeseries_rows: list[dict[str, str]],
 ) -> list[dict[str, object]]:
+    """
+    Selecciona hasta 3 casos representativos para las series temporales del dashboard.
+
+    Lógica de selección:
+      - "Mejor cobertura": combinación con mayor ``house_coverage_pct_mean``.
+      - "Menor cobertura": combinación con menor ``house_coverage_pct_mean``.
+      - "Referencia": combinación con cobertura media próxima a la mediana
+        (preferiblemente TTL=120 s, buffer=128 paquetes).
+
+    Si todas las combinaciones tienen la misma cobertura se devuelve un único
+    "caso representativo".  Se deduplicam casos con comportamientos idénticos.
+
+    Retorna lista de dicts con claves ``kind``, ``name``, ``key`` y ``color``.
+    """
     if not aggregated_rows:
         return []
 
@@ -337,6 +452,13 @@ def select_cases(
 
 
 def summarize_findings(aggregated_rows: list[dict[str, str]]) -> list[str]:
+    """
+    Genera automáticamente hallazgos textuales para la campaña TTL × Buffer.
+
+    Identifica: mejor cobertura, menor delay E2E, menor AoI, mayor TTL drop
+    en sensores y mayor ocupación de buffer en agrobots.
+    Retorna lista de strings para el HTML del dashboard.
+    """
     best_coverage = max(aggregated_rows, key=lambda row: float(row["house_coverage_pct_mean"]))
     lowest_delay = min(aggregated_rows, key=lambda row: float(row["house_e2e_delay_avg_s_mean"]))
     lowest_aoi = min(aggregated_rows, key=lambda row: float(row["house_aoi_avg_s_mean"]))
@@ -356,6 +478,12 @@ def metric_matrix(
     aggregated_rows: list[dict[str, str]],
     metric: str,
 ) -> dict[tuple[float, int], float]:
+    """
+    Construye un diccionario ``{(ttl, buffer): metric_mean}`` para un heatmap.
+
+    Extrae la columna ``<metric>_mean`` de cada fila agregada y la indexa
+    por la clave compuesta (TTL, buffer).
+    """
     matrix: dict[tuple[float, int], float] = {}
     for row in aggregated_rows:
         key = (float(row[TTL_FIELD]), int(float(row[BUFFER_FIELD])))
@@ -369,6 +497,17 @@ def render_heatmaps_dashboard(
     ttl_values: list[float],
     buffer_values: list[int],
 ) -> None:
+    """
+    Genera el SVG de heatmaps de la campaña TTL × Buffer.
+
+    Produce un SVG de 1560×1320 px con 9 heatmaps en cuadrícula 3×3:
+      Fila 1: cobertura final, delay E2E, AoI.
+      Fila 2: TTL drops en sensores, en agrobots, en UGVs.
+      Fila 3: buffer medio en sensores, en agrobots, en UGVs.
+
+    Cada celda del heatmap muestra la media sobre las corridas del grupo y
+    usa una escala de color interpolada de bajo (azul claro) a alto (azul intenso).
+    """
     width = 1560
     height = 1320
     gap = 24
@@ -430,6 +569,16 @@ def render_timeseries_dashboard(
     timeseries_rows: list[dict[str, str]],
     selected_cases: list[dict[str, object]],
 ) -> None:
+    """
+    Genera el SVG de series temporales de casos representativos de TTL × Buffer.
+
+    Produce un SVG de 1440×520 px con 2 paneles:
+      1. Cobertura en casa vs tiempo para los casos seleccionados.
+      2. AoI promedio vs tiempo para los casos seleccionados.
+
+    Las leyendas muestran el nombre del caso (mejor/referencia/menor) junto con
+    la etiqueta ``TTL X s / Buf Y``.
+    """
     case_count = len(selected_cases)
     case_id_map = {float(index + 1): case for index, case in enumerate(selected_cases)}
     color_map = {format_float(case_id, 1): case["color"] for case_id, case in case_id_map.items()}
@@ -507,6 +656,12 @@ def render_index_html(
     summary_rows: list[dict[str, str]],
     selected_cases: list[dict[str, object]],
 ) -> None:
+    """
+    Genera el ``index.html`` del dashboard de la campaña TTL × Buffer.
+
+    Incluye hallazgos automáticos, lista de casos temporales seleccionados,
+    tabla de resumen por combinación y los SVG de heatmaps y series temporales.
+    """
     findings = summarize_findings(aggregated_rows)
     case_items = [
         f"{case['name']}: {case_label(case['key'][0], case['key'][1])}"
@@ -535,6 +690,13 @@ def render_index_html(
 
 
 def main() -> int:
+    """
+    Punto de entrada del script de visualización de la campaña TTL × Buffer.
+
+    Flujo: resuelve directorio → lee manifest → une summaries 2D → agrega 2D
+    → agrega timeseries 2D → selecciona casos representativos → escribe CSVs
+    → genera heatmaps SVG → genera timeseries SVG → genera index.html.
+    """
     args = parse_args()
     repo_root = Path(__file__).resolve().parents[1]
     results_root = resolve_results_dir(args.results_dir, repo_root, CAMPAIGN_NAME)

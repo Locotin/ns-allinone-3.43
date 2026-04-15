@@ -1,4 +1,43 @@
 #!/usr/bin/env python3
+"""
+plot_contact_range_campaign.py
+===============================
+Script de análisis y visualización para la campaña de rango de contacto.
+
+Lee los artefactos generados por ``run_contact_range_campaign.py``, consolida
+las métricas de todas las corridas y produce un dashboard HTML+SVG autocontenido.
+
+Salidas generadas
+-----------------
+Dentro de ``results/contact_range_campaign/<timestamp>/``:
+
+``tables/``
+    - ``summary_all_runs.csv``
+        Tabla con una fila por corrida que combina columnas del manifest
+        y del archivo ``summary_<label>.csv`` de adhoc.cc.
+    - ``summary_aggregated_by_range.csv``
+        Estadísticas descriptivas (media, desv. estándar, mín, máx)
+        de cada métrica agrupadas por valor de rango de contacto.
+    - ``timeseries_mean_by_range_time.csv``
+        Series temporales medias por (rango, instante) sobre todas las corridas.
+
+``plots/``
+    - ``summary_dashboard.svg``
+        Dashboard SVG con 6 paneles de métricas finales (cobertura, delay E2E,
+        PDR por etapa, AoI, ocupación de buffer y drops por TTL).
+    - ``timeseries_dashboard.svg``
+        Dashboard SVG con 3 paneles de series temporales (cobertura en casa,
+        cobertura en agrobots, AoI media).
+    - ``index.html``
+        Dashboard HTML con hallazgos automáticos, tabla resumen y visualizaciones.
+
+Uso
+---
+    python3 scratch/plot_contact_range_campaign.py
+    python3 scratch/plot_contact_range_campaign.py results/contact_range_campaign/20240101_120000
+
+Si no se indica directorio, usa el más reciente en ``results/contact_range_campaign/``.
+"""
 
 from __future__ import annotations
 
@@ -34,6 +73,7 @@ GROUP_FIELD = "contact_range"
 
 
 def parse_args() -> argparse.Namespace:
+    """Parsea el argumento opcional ``results_dir`` (directorio de la campaña a visualizar)."""
     parser = argparse.ArgumentParser(
         description="Consolida y visualiza una carpeta de contact_range_campaign."
     )
@@ -46,14 +86,17 @@ def parse_args() -> argparse.Namespace:
 
 
 def x_tick_label(contact_range: float) -> str:
+    """Etiqueta compacta del eje X (sin unidad) para un valor de rango de contacto."""
     return compact_label(contact_range)
 
 
 def legend_label(contact_range: float) -> str:
+    """Etiqueta de leyenda con unidades (ej. ``"52 m"``) para un valor de rango."""
     return f"{compact_label(contact_range)} m"
 
 
 def run_count_label(aggregated_rows: list[dict[str, str]]) -> str:
+    """Genera una cadena descriptiva del número de corridas por rango (para subtítulos)."""
     run_counts = sorted({int(row["runs"]) for row in aggregated_rows})
     if len(run_counts) == 1:
         count = run_counts[0]
@@ -62,6 +105,11 @@ def run_count_label(aggregated_rows: list[dict[str, str]]) -> str:
 
 
 def build_highlight_table(aggregated_rows: list[dict[str, str]]) -> str:
+    """
+    Genera la tabla HTML de resumen con las métricas clave por rango de contacto.
+
+    Columnas: Rango (m), Cobertura final (%), Delay E2E (s), AoI (s), PDR Stage 3 (%).
+    """
     headers = ["Rango", "Cobertura final", "Delay E2E", "AoI", "PDR Stage 3"]
     rows = []
     for row in aggregated_rows:
@@ -89,6 +137,13 @@ def build_highlight_table(aggregated_rows: list[dict[str, str]]) -> str:
 
 
 def summarize_findings(aggregated_rows: list[dict[str, str]]) -> list[str]:
+    """
+    Genera automáticamente hallazgos textuales a partir de las filas agregadas.
+
+    Identifica el mejor rango para cobertura, menor delay E2E, menor AoI,
+    la variación total de cobertura entre extremos, y los mejores PDR de Stage 2 y 3.
+    Retorna una lista de strings listos para mostrar como ``<li>`` en el dashboard.
+    """
     best_coverage = max(aggregated_rows, key=lambda row: float(row["house_coverage_pct_mean"]))
     best_delay = min(aggregated_rows, key=lambda row: float(row["house_e2e_delay_avg_s_mean"]))
     best_aoi = min(aggregated_rows, key=lambda row: float(row["house_aoi_avg_s_mean"]))
@@ -120,6 +175,19 @@ def render_summary_dashboard(
     aggregated_rows: list[dict[str, str]],
     group_values: list[float],
 ) -> None:
+    """
+    Genera el SVG de métricas finales de la campaña de rango de contacto.
+
+    Produce un SVG de 1400×1120 px con 6 paneles en cuadrícula 2×3:
+      1. Scatter + media de cobertura final en casa por rango.
+      2. Scatter + media de delay E2E por rango.
+      3. Barras agrupadas de PDR Stage 2 vs Stage 3.
+      4. Scatter + media de AoI por rango.
+      5. Barras de ocupación de buffer (agrobot vs UGV).
+      6. Barras de drops por TTL (agrobot vs UGV).
+
+    Escribe el SVG directamente en ``output_path``.
+    """
     range_colors = build_group_color_map(group_values)
     run_values = {
         "coverage": {group_value: [] for group_value in group_values},
@@ -270,6 +338,16 @@ def render_timeseries_dashboard(
     timeseries_rows: list[dict[str, str]],
     group_values: list[float],
 ) -> None:
+    """
+    Genera el SVG de dinámica temporal de la campaña de rango de contacto.
+
+    Produce un SVG de 1440×520 px con 3 paneles de series temporales:
+      1. Cobertura en casa vs tiempo (media por rango).
+      2. Cobertura en agrobots vs tiempo (recepción intermedia).
+      3. AoI promedio vs tiempo (frescura de información).
+
+    Las series muestran promedios agregados sobre todas las corridas de cada rango.
+    """
     range_colors = build_group_color_map(group_values)
 
     def metric_series(metric: str) -> dict[float, list[tuple[float, float]]]:
@@ -346,6 +424,12 @@ def render_index_html(
     summary_rows: list[dict[str, str]],
     group_values: list[float],
 ) -> None:
+    """
+    Genera el ``index.html`` del dashboard de la campaña de rango de contacto.
+
+    Combina hallazgos automáticos, tabla de resumen por rango y los SVG de
+    métricas finales y dinámica temporal en un HTML con tarjetas estilizadas.
+    """
     findings = summarize_findings(aggregated_rows)
     range_summary = ", ".join(legend_label(group_value) for group_value in group_values)
     render_dashboard_index_html(
@@ -369,6 +453,18 @@ def render_index_html(
 
 
 def main() -> int:
+    """
+    Punto de entrada del script de visualización.
+
+    Flujo de ejecución
+    ------------------
+    1. Resuelve el directorio de resultados de la campaña.
+    2. Lee el manifest y une las filas de resumen de cada corrida.
+    3. Calcula estadísticas agregadas por rango (summary y timeseries).
+    4. Escribe los CSVs consolidados en ``tables/``.
+    5. Genera los SVG de métricas finales y temporales en ``plots/``.
+    6. Genera el ``index.html`` del dashboard.
+    """
     args = parse_args()
     repo_root = Path(__file__).resolve().parents[1]
     results_root = resolve_results_dir(args.results_dir, repo_root, CAMPAIGN_NAME)

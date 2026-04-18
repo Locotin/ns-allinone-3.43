@@ -44,6 +44,22 @@ namespace
 // - el rol metodológico de cada bloque;
 // - por qué se eligieron ciertas APIs de ns-3;
 // - cómo se traducen los conceptos del experimento a objetos del simulador.
+//
+// Contrato experimental resumido:
+// - Sensores estáticos generan muestras periódicas y nunca entregan directo a casa.
+// - Agrobots realizan el primer relevo y UGVs el segundo relevo hacia la casa.
+// - Los seguidores no se mueven libremente por todo el campo: su movilidad se
+//   define relativa al líder del cluster.
+// - El forwarding store-carry-forward se habilita por contacto geométrico entre
+//   nodos, mientras que la entrega real viaja sobre la pila IP/UDP estándar de ns-3.
+//
+// Supuestos y limitaciones metodológicas:
+// - El "contacto" se aproxima con distancia euclideana y umbrales fijos; no se
+//   modelan RSSI, SNR adaptativa, fading ni shadowing del cultivo.
+// - FlowMonitor mide flujos IP/UDP por etapa, pero no observa el estado interno
+//   de los buffers SCF; esas métricas salen de cálculo manual en las apps.
+// - El AoI se calcula en la casa usando la actualización más fresca observada por
+//   sensor; paquetes en tránsito o aún retenidos no cuentan como información disponible.
 // -----------------------------------------------------------------------------
 
 // StageMetrics resume lo que FlowMonitor reporta por cada salto lógico.
@@ -1439,6 +1455,10 @@ main(int argc, char* argv[])
     uint32_t sensorsPerField = 24;
     double fieldWidth = 240.0;
     double fieldHeight = 180.0;
+
+    // Baseline geométrico y de movilidad sobre el que se montan las campañas.
+    // Cambiar estos valores modifica la cinemática del experimento, no solo la
+    // forma de observarlo.
     double leaderSpeed = 2.0;
     double agrobotLeaderPause = 0.0;
     double followerSpeedMax = 1.2;
@@ -1452,6 +1472,9 @@ main(int argc, char* argv[])
     uint32_t packetSize = 128;
     uint32_t rngRun = 1; // Semilla de aleatoriedad
     std::string flowmonFile = "flowmon-adhoc.xml"; // Nombre base de dump logico
+
+    // Parámetros que sí cambian la semántica store-carry-forward: oportunidad
+    // de contacto, persistencia de la información y presión sobre la memoria local.
     double sensorContactRange = 35.0; // Distancia (radio RF teorico) asimilada a contacto de software.
     double level1ToLevel2ContactRange = 30.0;
     double level2ToHouseContactRange = 50.0;
@@ -1460,7 +1483,7 @@ main(int argc, char* argv[])
     uint32_t bufferCapacityPackets = 128;
     double sampleTtl = 120.0; // La data agrícola deja de ser valiosa a los 2 minutos.
     double aoiSamplePeriod = 1.0;
-    double metricsSampleInterval = 1.0;
+    double metricsSampleInterval = 1.0; // Solo cambia la resolución de exportación, no la dinámica de red.
     std::string summaryCsvFile = "summary-adhoc.csv";
     std::string timeseriesCsvFile = "timeseries-adhoc.csv";
     std::string metricsRunLabel;
@@ -1486,7 +1509,7 @@ main(int argc, char* argv[])
                  "Pausa del lider agrobot en random-waypoint (s)",
                  agrobotLeaderPause);
     cmd.AddValue("followerSpeedMax",
-                 "Velocidad maxima de seguidores agrobot (m/s)",
+                 "Velocidad maxima de seguidores agrobot (m/s); afecta la movilidad local del cluster, no toda la red",
                  followerSpeedMax);
     cmd.AddValue("level2LeaderSpeed", "Velocidad del lider UGV (m/s)", level2LeaderSpeed);
     cmd.AddValue("level2FollowerSpeedMax",
@@ -1501,10 +1524,10 @@ main(int argc, char* argv[])
     cmd.AddValue("rngRun", "Indice de corrida RNG para reproducibilidad", rngRun);
     cmd.AddValue("flowmonFile", "Archivo XML de salida para FlowMonitor", flowmonFile);
     cmd.AddValue("sensorContactRange",
-                 "Umbral de contacto sensor->lider agrobot para store-carry-forward (m)",
+                 "Umbral de contacto sensor->lider agrobot para store-carry-forward (m); aproxima la oportunidad del primer relevo",
                  sensorContactRange);
     cmd.AddValue("level1ToLevel2ContactRange",
-                 "Umbral de contacto lider agrobot -> lider UGV para store-carry-forward (m)",
+                 "Umbral de contacto lider agrobot -> lider UGV para store-carry-forward (m); parametro barrido en contact_range_campaign",
                  level1ToLevel2ContactRange);
     cmd.AddValue("level2ToHouseContactRange",
                  "Umbral de contacto lider UGV -> casa para store-carry-forward (m)",
@@ -1515,11 +1538,15 @@ main(int argc, char* argv[])
     cmd.AddValue("forwardBurstPackets",
                  "Maximo de muestras reenviadas por cada oportunidad de contacto",
                  forwardBurstPackets);
-    cmd.AddValue("bufferCapacityPackets", "Capacidad de buffer por nodo store-carry-forward", bufferCapacityPackets);
-    cmd.AddValue("sampleTtl", "TTL de cada muestra en store-carry-forward (s)", sampleTtl);
+    cmd.AddValue("bufferCapacityPackets",
+                 "Capacidad de buffer por nodo store-carry-forward; controla saturacion local de relays",
+                 bufferCapacityPackets);
+    cmd.AddValue("sampleTtl",
+                 "TTL de cada muestra en store-carry-forward (s); modela cuanto tiempo sigue siendo util la informacion",
+                 sampleTtl);
     cmd.AddValue("aoiSamplePeriod", "Periodo de muestreo de Age of Information en la casa (s)", aoiSamplePeriod);
     cmd.AddValue("metricsSampleInterval",
-                 "Periodo de muestreo para exportar la serie temporal de metricas (s)",
+                 "Periodo de muestreo para exportar la serie temporal de metricas (s); no cambia forwarding ni movilidad",
                  metricsSampleInterval);
     cmd.AddValue("summaryCsvFile", "Archivo CSV de resumen final de la corrida", summaryCsvFile);
     cmd.AddValue("timeseriesCsvFile", "Archivo CSV de serie temporal de metricas", timeseriesCsvFile);
@@ -1760,6 +1787,8 @@ main(int argc, char* argv[])
     // AodvHelper se eligió porque la documentación de ns-3 lo posiciona como un
     // protocolo MANET reactivo (Ad-hoc On-demand Distance Vector) apropiado 
     // cuando la conectividad cambia velozmente por movilidad (como drones y tractores).
+    // En este modelo AODV resuelve el encaminamiento IP cuando existe enlace,
+    // pero no decide la oportunidad de forwarding: eso lo hace la app SCF por rango.
     AodvHelper aodv;
     InternetStackHelper stack; // Dota a los nodos vacios de una Pila IP con soporte TCP/UDP.
     stack.SetRoutingHelper(aodv);
@@ -1844,9 +1873,9 @@ main(int argc, char* argv[])
         sensorIndexByIp.emplace(ifaces.GetAddress(sensorStartIndex + i).Get(), i);
     }
 
-    // FlowMonitor instrumenta mágicamente a todos los nodos a nivel IP/flujo, "esnifando" las tarjetas.
-    // Se usa para medir PDR global y caídas en las tres etapas lógicas; las métricas SCF finas avanzadas siguen
-    // calculándose manualmente a nivel de aplicación (buffers, AoI) porque FlowMonitor ignora concepto de buffer DTN local.
+    // FlowMonitor observa flujos IP/UDP y permite reconstruir PDR por etapa lógica.
+    // No ve estados internos del buffer, deduplicación ni AoI, así que esas
+    // métricas siguen siendo responsabilidad de las aplicaciones SCF y de la casa.
     FlowMonitorHelper flowmonHelper;
     Ptr<FlowMonitor> monitor = flowmonHelper.InstallAll();
 
@@ -1947,6 +1976,10 @@ main(int argc, char* argv[])
     // -------------------------------------------------------------------------
     // La serie temporal queda acotada a las métricas que alimentan los
     // dashboards: cobertura intermedia/final y frescura observada en la casa.
+    // Procedencia:
+    // - agrobot_coverage_pct: cálculo manual sobre sensores que ya alcanzaron el primer relevo.
+    // - house_coverage_pct: cálculo manual sobre sensores con al menos una entrega en casa.
+    // - house_aoi_avg_s: cálculo manual en HouseCollectorApp sobre la actualización más fresca visible.
     // Preparar el esquema del archivo .CSV
     std::vector<std::string> timeseriesHeaderFields = {"run_label",
                                                        "time_s",
@@ -2015,7 +2048,9 @@ main(int argc, char* argv[])
     std::vector<bool> ugvLeadersDelivered(nLevel2Clusters, false);
 
     // Reconstruimos las etapas lógicas (Etapa 2 y Etapa 3 IP) que luego se exponen en los dashboards
-    // finales para análisis de Packet Delivery Ratio PDR. La etapa 1 sigue disponible vía cobertura temporal agrobot.
+    // finales para análisis de Packet Delivery Ratio PDR. Estas métricas provienen de FlowMonitor
+    // filtrando por puerto UDP, así que representan desempeño IP por etapa y no estado interno SCF.
+    // La etapa 1 sigue disponible vía cobertura temporal agrobot.
     const StageMetrics stage2Metrics =
         CollectStageMetrics(stats,
                             classifier,
@@ -2077,6 +2112,10 @@ main(int argc, char* argv[])
     // -------------------------------------------------------------------------
     // Una fila por corrida completa. Se exporta solo el subconjunto escalar que consumen los
     // dashboards de graficación comparativos de rango, velocidad y TTL+buffer para análisis científico.
+    // Procedencia:
+    // - stage2_pdr_pct y stage3_pdr_pct: derivados de FlowMonitor.
+    // - house_coverage_pct, house_e2e_delay_avg_s y house_aoi_avg_s: calculados en HouseCollectorApp.
+    // - *_ttl_drops y *_avg_buffer_occ: agregados manualmente desde StoreCarryForwardApp por capa.
     std::vector<std::string> summaryHeaderFields = {"run_label",
                                                     "rng_run",
                                                     "sim_time_s",
